@@ -1,9 +1,11 @@
+import base64
 import json
 from types import SimpleNamespace
 
 import pytest
 from google import genai
 from google.genai import types
+from pydantic import BaseModel, ValidationError
 
 import translator
 from translator import Interpretation, Interpreter, Speaker
@@ -15,13 +17,21 @@ def usage_log(tmp_path):
     return UsageLog(str(tmp_path / "usage.db"))
 
 
-def fake_gemini(captured, payload, usage=None):
-    """A real genai.Client whose HTTP layer returns `payload` and records the request body."""
+def fake_gemini(captured, payload, usage=None, paths=None):
+    """A real genai.Client whose HTTP layer returns `payload` and records the request body (and path).
+
+    payload None means a response without candidates, as when Gemini blocks a prompt."""
     client = genai.Client(api_key="fake")
 
     def request(method, path, body, http_options=None):
         captured.append(body)
-        response = {"candidates": [{"content": {"role": "model", "parts": [{"text": json.dumps(payload)}]}}]}
+        if paths is not None:
+            paths.append(path)
+        if payload is None:
+            response = {"promptFeedback": {"blockReason": "SAFETY"}}
+        else:
+            text = payload if isinstance(payload, str) else json.dumps(payload)
+            response = {"candidates": [{"content": {"role": "model", "parts": [{"text": text}]}}]}
         if usage:
             response["usageMetadata"] = usage
         return SimpleNamespace(headers={}, body=json.dumps(response))
@@ -40,24 +50,26 @@ def test_interpret_parses_and_normalizes(usage_log):
     result = Interpreter(client, "gemini-test", usage_log).interpret("Привет", "zh")
     assert result == Interpretation(source_lang="ru", text="Привет", translation="Salom")
     body = captured[0]
-    assert "Simplified Chinese (Mandarin)" in system_text(body)
-    assert translator.LIVE_PROMPT.strip() not in system_text(body)
-    assert "Conversation so far" not in system_text(body)
+    assert system_text(body) == translator.INTERPRET_PROMPT.format(partner="Simplified Chinese (Mandarin)")
+    assert body["contents"] == [{"role": "user", "parts": [{"text": "Привет"}]}]
     config = body["generationConfig"]
     assert config["responseMimeType"] == "application/json"
     assert config["responseSchema"]["required"] == ["source_lang", "text", "translation"]
 
 
-def test_live_mode_and_history_go_into_the_system_prompt(usage_log):
+def test_history_goes_into_the_system_prompt(usage_log):
     captured = []
     client = fake_gemini(captured, {"source_lang": "zh", "text": "多少钱", "translation": "Qancha?"})
-    history = [Interpretation(source_lang="uz", text="Bu ko'ylak {x}", translation="这件衬衫")]
-    Interpreter(client, "m", usage_log).interpret("多少钱", "tr", history, live=True)
+    history = [
+        Interpretation(source_lang="uz", text="Bu ko'ylak {x}", translation="这件衬衫"),
+        Interpretation(source_lang="zh", text="很好", translation="Juda yaxshi"),
+    ]
+    Interpreter(client, "m", usage_log).interpret("多少钱", "tr", history)
     text = system_text(captured[0])
+    assert text.startswith(translator.INTERPRET_PROMPT.format(partner="Turkish"))
     assert "Turkish speaker" in text
-    assert "fragment of continuous live speech" in text
-    assert "[uz] Bu ko'ylak {x} => 这件衬衫" in text
-    assert text.index("fragment of continuous") < text.index("Conversation so far")
+    # oldest first, braces in user text are not treated as format fields
+    assert text.endswith("translate only the new input:\n[uz] Bu ko'ylak {x} => 这件衬衫\n[zh] 很好 => Juda yaxshi")
 
 
 def test_usage_and_cost_are_recorded(usage_log):
@@ -155,3 +167,152 @@ def test_history_is_copied_before_use(usage_log):
     history = deque([Interpretation(source_lang="uz", text="x", translation="y")])
     Interpreter(client, "m", usage_log).interpret("a", "zh", history)
     assert "[uz] x => y" in system_text(captured[0])
+
+
+# ---------------------------------------------------------------- Interpreter.generate
+
+
+class Item(BaseModel):
+    name: str
+    count: int
+
+
+class Basket(BaseModel):
+    items: list[Item]
+    paid: bool
+    comment: str
+
+
+BASKET = {"items": [{"name": "olma", "count": 3}, {"name": "non", "count": 1}], "paid": True, "comment": " ok "}
+
+
+def test_generate_parses_into_the_given_schema(usage_log):
+    captured, paths = [], []
+    client = fake_gemini(captured, BASKET, paths=paths)
+    result = Interpreter(client, "base-model", usage_log).generate(["part one", "part two"], "Be exact.", Basket)
+    assert isinstance(result, Basket)
+    assert result == Basket(items=[Item(name="olma", count=3), Item(name="non", count=1)], paid=True, comment=" ok ")
+    body = captured[0]
+    assert paths == ["models/base-model:generateContent"]
+    assert system_text(body) == "Be exact."
+    assert body["contents"] == [{"role": "user", "parts": [{"text": "part one"}, {"text": "part two"}]}]
+    config = body["generationConfig"]
+    assert config["responseMimeType"] == "application/json"
+    schema = config["responseSchema"]
+    assert schema["required"] == ["items", "paid", "comment"]
+    assert schema["properties"]["items"]["type"] == "ARRAY"
+    assert schema["properties"]["items"]["items"]["required"] == ["name", "count"]
+    assert schema["properties"]["items"]["items"]["properties"]["count"]["type"] == "INTEGER"
+    # no tools are declared, so the SDK never calls functions on its own
+    assert "tools" not in body
+
+
+def thinking_level(body):
+    thinking = body["generationConfig"]["thinkingConfig"]
+    return thinking.get("thinkingLevel") or thinking.get("thinking_level")
+
+
+def test_generate_defaults_low_thinking_and_low_temperature(usage_log):
+    captured = []
+    Interpreter(fake_gemini(captured, BASKET), "m", usage_log).generate("x", "s", Basket)
+    assert thinking_level(captured[0]) == "LOW"
+    assert captured[0]["generationConfig"]["temperature"] == pytest.approx(0.2)
+
+
+def test_generate_passes_thinking_temperature_and_model_override(usage_log):
+    captured, paths = [], []
+    interpreter = Interpreter(fake_gemini(captured, BASKET, paths=paths), "base-model", usage_log)
+    interpreter.generate("x", "s", Basket, thinking="medium", temperature=0.7, model="gemini-pro-test")
+    interpreter.generate("x", "s", Basket, thinking="high", model=None)
+    assert paths == ["models/gemini-pro-test:generateContent", "models/base-model:generateContent"]
+    assert [thinking_level(b) for b in captured] == ["MEDIUM", "HIGH"]
+    assert captured[0]["generationConfig"]["temperature"] == pytest.approx(0.7)
+    assert interpreter.model == "base-model"  # the override is per call
+
+
+def test_generate_records_usage_with_audio_priced_separately(usage_log):
+    usage = {
+        "promptTokenCount": 2000,
+        "candidatesTokenCount": 300,
+        "thoughtsTokenCount": 700,
+        "promptTokensDetails": [{"modality": "AUDIO", "tokenCount": 1500}, {"modality": "TEXT", "tokenCount": 500}],
+    }
+    interpreter = Interpreter(
+        fake_gemini([], BASKET, usage), "m", usage_log, price_in=0.5, price_audio_in=1.0, price_out=3.0
+    )
+    interpreter.generate("x", "s", Basket)
+    interpreter.generate("x", "s", Basket)
+    t = usage_log.totals("gemini", 0)
+    assert (t.requests, t.input_tokens, t.audio_tokens, t.output_tokens) == (2, 4000, 3000, 2000)
+    assert t.cost == pytest.approx(2 * (500 * 0.5 + 1500 * 1.0 + 1000 * 3.0) / 1e6)
+
+
+def test_generate_without_usage_metadata_records_nothing(usage_log):
+    Interpreter(fake_gemini([], BASKET), "m", usage_log).generate("x", "s", Basket)
+    assert usage_log.totals("gemini", 0).requests == 0
+
+
+def test_generate_handles_partial_usage_metadata(usage_log):
+    interpreter = Interpreter(fake_gemini([], BASKET, {"promptTokenCount": 10}), "m", usage_log, price_in=1.0)
+    interpreter.generate("x", "s", Basket)
+    t = usage_log.totals("gemini", 0)
+    assert (t.requests, t.input_tokens, t.audio_tokens, t.output_tokens) == (1, 10, 0, 0)
+    assert t.cost == pytest.approx(10 / 1e6)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"items": [], "paid": "maybe", "comment": "x"}, {"items": []}, "not json at all", None],
+    ids=["wrong-type", "missing-field", "not-json", "blocked"],
+)
+def test_generate_rejects_output_that_does_not_fit_the_schema_but_still_bills_it(usage_log, payload):
+    client = fake_gemini([], payload, {"promptTokenCount": 7, "candidatesTokenCount": 3})
+    with pytest.raises(ValidationError):
+        Interpreter(client, "m", usage_log).generate("x", "s", Basket)
+    t = usage_log.totals("gemini", 0)
+    assert (t.requests, t.input_tokens, t.output_tokens) == (1, 7, 3)
+
+
+def test_generate_propagates_api_errors_without_recording_usage(usage_log):
+    client = genai.Client(api_key="fake")
+
+    def request(method, path, body, http_options=None):
+        raise genai.errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}})
+
+    client.models._api_client.request = request
+    with pytest.raises(genai.errors.ServerError):
+        Interpreter(client, "m", usage_log).generate("x", "s", Basket)
+    assert usage_log.totals("gemini", 0).requests == 0
+
+
+def test_generate_sends_audio_parts_inline(usage_log):
+    captured = []
+    wav = b"RIFF....WAVEfmt "
+    contents = ["NEW SEGMENT:", types.Part.from_bytes(data=wav, mime_type="audio/wav")]
+    Interpreter(fake_gemini(captured, BASKET), "m", usage_log).generate(contents, "s", Basket)
+    parts = captured[0]["contents"][0]["parts"]
+    assert parts[0] == {"text": "NEW SEGMENT:"}
+    inline = parts[1]["inlineData"]
+    assert (inline.get("mimeType") or inline.get("mime_type")) == "audio/wav"
+    assert base64.b64decode(inline["data"]) == wav
+
+
+def test_report_call_uses_the_report_model_and_medium_thinking(usage_log):
+    """SeminarAI.report goes through Interpreter.generate with its own model and more thinking."""
+    from seminar import Report, SeminarAI
+
+    report = {
+        "title": "T", "overview": "O", "speakers": [], "timeline": [], "topics": [], "qa": [],
+        "decisions": [], "action_items": [], "glossary": [],
+    }
+    captured, paths = [], []
+    interpreter = Interpreter(fake_gemini(captured, report, paths=paths), "flash", usage_log)
+    result = SeminarAI(interpreter, report_model="pro").report("[09:00] S1 (Ali): Salom", "S1: Ali", "period")
+    assert isinstance(result, Report) and result.title == "T"
+    assert paths == ["models/pro:generateContent"]
+    assert thinking_level(captured[0]) == "MEDIUM"
+    assert captured[0]["generationConfig"]["temperature"] == pytest.approx(0.3)
+
+    paths.clear()
+    SeminarAI(interpreter).report("t", "s", "p")  # no report model configured: the main model
+    assert paths == ["models/flash:generateContent"]

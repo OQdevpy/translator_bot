@@ -5,6 +5,7 @@ import asyncio
 import math
 import threading
 import time
+from contextlib import closing
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -247,7 +248,8 @@ def test_seminar_ai_listen_builds_prompt_and_normalizes():
                                    text="  Hello there  ", complete=True))
     ai = SeminarAI(interp)
     refs = [{"id": "S1", "label": "Aziz", "voice": "", "ref_wav": b"RIFF-ref"}]
-    result = ai.listen(b"RIFF-new", refs, {"S1": 0.7012}, ["[S1 Aziz] earlier"], {"summary": "Xulosa"})
+    notes = {"summary": "Xulosa", "glossary": [{"term": "KPI", "translation": "asosiy ko'rsatkich", "note": ""}]}
+    result = ai.listen(b"RIFF-new", refs, {"S1": 0.7012}, ["[S1 Aziz] earlier"], notes)
     assert (result.speaker, result.speaker_name, result.source_lang, result.text) == ("S1", "Aziz", "en", "Hello there")
     call = interp.calls[0]
     assert call["schema"] is Heard and call["kw"]["temperature"] == 0.1
@@ -256,7 +258,9 @@ def test_seminar_ai_listen_builds_prompt_and_normalizes():
     assert contents[1].inline_data.data == b"RIFF-ref"
     assert contents[2] == "NEW SEGMENT:" and contents[3].inline_data.data == b"RIFF-new"
     assert "   - S1: 0.70" in call["system"]
-    assert "Xulosa" in call["system"] and "[S1 Aziz] earlier" in call["system"]
+    # listening needs only the spellings; the summary is for interpreting (and costs tokens on every phrase)
+    assert "KPI = asosiy ko'rsatkich" in call["system"] and "Xulosa" not in call["system"]
+    assert "[S1 Aziz] earlier" in call["system"]
 
     ai.listen(b"RIFF-new", [], {}, [], {})
     system = interp.calls[1]["system"]
@@ -334,8 +338,6 @@ def test_store_speakers_roundtrip(store, sid):
     assert len(store.speakers(sid)) == 2
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: save_speaker uses INSERT OR REPLACE, which gives the row a new rowid, "
-                                       "so speakers() (ORDER BY rowid) moves every updated speaker to the end")
 def test_store_speakers_keep_creation_order_after_update(store, sid):
     seed_speaker(store, sid, "S1")
     seed_speaker(store, sid, "S2")
@@ -428,16 +430,32 @@ def test_store_delete_session_removes_everything(store, sid):
 def test_store_reports(store, sid):
     first = store.save_report(sid, 10.0, 20.0, {"title": "Birinchi", "overview": "ü"})
     second = store.save_report(sid, 30.0, 40.0, {"title": "Ikkinchi"})
-    with store._connect() as db:  # make created_at deterministic
+    with closing(store._connect()) as db, db:  # make created_at deterministic
         db.execute("UPDATE reports SET created_at = 1 WHERE id = ?", (first,))
         db.execute("UPDATE reports SET created_at = 2 WHERE id = ?", (second,))
     listed = store.reports(sid)
     assert [r["id"] for r in listed] == [second, first]
-    assert set(listed[0]) == {"id", "created_at", "start", "end"}
+    assert set(listed[0]) == {"id", "created_at", "start", "end", "status", "error"}
+    assert listed[0]["status"] == "done"
     row = store.report(first)
     assert row["session_id"] == sid and (row["start"], row["end"]) == (10.0, 20.0)
     assert row["report"] == {"title": "Birinchi", "overview": "ü"}
     assert store.report(12345) is None
+    assert store.report(2**70) is None and store.session(2**70) is None  # beyond SQLite's integers
+
+
+def test_store_report_jobs(store, sid):
+    rid = store.start_report(sid, 10.0, 20.0)
+    assert (store.report(rid)["status"], store.report(rid)["report"]) == ("pending", {})
+    store.finish_report(rid, {"title": "Tayyor"})
+    assert (store.report(rid)["status"], store.report(rid)["report"]) == ("done", {"title": "Tayyor"})
+    failed = store.start_report(sid, 10.0, 20.0)
+    store.fail_report(failed, "xato")
+    assert (store.report(failed)["status"], store.report(failed)["error"]) == ("failed", "xato")
+    stuck = store.start_report(sid, 10.0, 20.0)
+    store.fail_unfinished_reports("restart")
+    assert [store.report(r)["status"] for r in (rid, failed, stuck)] == ["done", "failed", "failed"]
+    assert store.report(stuck)["error"] == "restart"
 
 
 # ---------------------------------------------------------------- LiveSession: speaker resolution
@@ -624,9 +642,9 @@ def test_speaker_name_sets_label_once(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        for i in range(5):
+        for i in range(5):  # one at a time: the label at interpretation time is then deterministic
             await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
-        await drain(sess)
+            await drain(sess)
         sess.close()
         return sess, ws
 
@@ -688,7 +706,7 @@ def test_listen_gets_ranked_references_recent_lines_and_notes(store, sid, monkey
     seed_speaker(store, sid, "S2", centroid=E2, ref_wav=b"R2")
     seed_speaker(store, sid, "S3", centroid=E3, ref_wav=b"R3")
     seed_speaker(store, sid, "S4", centroid=None, ref_wav=None)  # nothing to send
-    emb = 0.3 * E1 + 0.5 * E2 + 0.4 * E3  # S2 > S3 > S1
+    emb = 0.5 * E1 + 0.55 * E2 + 0.52 * E3  # S2 > S3 > S1, all in the ambiguous zone
     ai = FakeAI([heard("birinchi", speaker="S2"), heard("ikkinchi", speaker="S2")])
 
     async def main():
@@ -703,6 +721,35 @@ def test_listen_gets_ranked_references_recent_lines_and_notes(store, sid, monkey
     assert first["references"] == ["S2", "S3"]
     assert first["recent"] == [] and first["notes"] == {"summary": "Iqtisod", "glossary": []}
     assert second["recent"] == ["[S2 Spiker 2] birinchi"]
+
+
+@pytest.mark.parametrize(
+    "emb, has_unknown_voice, sends",
+    [
+        (E1, False, False),  # surely S1: no need for Gemini to compare voices
+        (E1, True, False),  # surely S1 even with a speaker of unknown voice around
+        (E3, False, False),  # surely someone new
+        (E3, True, True),  # clearly not S1/S2, but maybe the speaker whose voice is unknown
+        (0.6 * E1 + 0.8 * E3, False, True),  # ambiguous
+        (None, False, True),  # no voiceprint for this phrase (too short)
+    ],
+    ids=["same", "same-with-unknown", "new", "new-or-unknown", "ambiguous", "no-voiceprint"],
+)
+def test_reference_recordings_only_when_voiceprints_cannot_decide(store, sid, emb, has_unknown_voice, sends):
+    seed_speaker(store, sid, "S1", centroid=E1, ref_wav=b"R1")
+    seed_speaker(store, sid, "S2", centroid=E2, ref_wav=b"R2")
+    if has_unknown_voice:
+        seed_speaker(store, sid, "S3", centroid=None, ref_wav=b"R3")
+    ai = FakeAI([heard("gap", speaker="S1")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
+        await sess.add_audio(1, make_wav(2.0), T0)
+        await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert bool(ai.listen_calls[0]["references"]) == sends
 
 
 # ---------------------------------------------------------------- LiveSession: thoughts and units
@@ -821,8 +868,6 @@ def test_idle_flush_waits_while_more_speech_is_queued(store, sid):
     assert [u["source"] for u in store.units(sid)] == ["Birinchidan ikkinchidan uchinchidan."]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: _idle_flush only checks listen_queue; a phrase the listen worker has "
-                                       "already dequeued and is transcribing is ignored, so the thought is split")
 def test_idle_flush_waits_for_phrase_being_transcribed(store, sid, monkeypatch):
     monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 0.1)
     gate, entered = threading.Event(), threading.Event()
@@ -867,24 +912,30 @@ def test_unit_max_seconds_flushes_unfinished_thought(store, sid, monkeypatch):
 
 
 def test_explicit_flush(store, sid):
-    ai = FakeAI([heard("to'xtatildi", speaker="new", complete=False)])
+    gate = threading.Event()
+    ai = FakeAI([heard("to'xtatildi", speaker="new", complete=False)],
+                interpret=[gated(Rendered(translation="To'xtatildi.", note=""), gate)])
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        sess.flush()  # nothing pending: no-op
-        await asyncio.sleep(0)
-        assert sess.unit_queue.empty()
-        await sess.add_audio(1, make_wav(2.0), T0)
-        await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
-        assert sess.idle_timer is not None
-        sess.flush()
-        assert sess.idle_timer is None and sess.pending == [] and sess.unit_queue.qsize() == 1
+        try:
+            sess.flush()  # nothing pending: no-op
+            await asyncio.sleep(0)
+            assert sess.unit_queue.empty() and ws.messages == []
+            await sess.add_audio(1, make_wav(2.0), T0)
+            await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+            assert sess.idle_timer is not None
+            sess.flush()
+            assert sess.idle_timer is None and sess.pending == [] and sess.unit_queue.qsize() == 1
+            await wait_for(lambda: ws.messages[-1] == {"type": "pending", "pending": [], "interpreting": 1})
+        finally:
+            gate.set()
         await drain(sess)
         sess.close()
         return ws
 
     ws = asyncio.run(main())
-    assert [u["source"] for u in store.units(sid)] == ["to'xtatildi"]
+    assert [(u["source"], u["translation"]) for u in store.units(sid)] == [("to'xtatildi", "To'xtatildi.")]
     assert {"type": "pending", "pending": [], "interpreting": 1} in ws.messages
 
 
@@ -1123,9 +1174,6 @@ def test_restart_pending_thought_continues_with_new_phrase(store, sid):
     assert store.pending_segments(sid) == []
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: after a restart all unlinked segments are restored as ONE pending "
-                                       "thought, so words of different speakers end up in one unit under the "
-                                       "first speaker")
 def test_restart_with_thoughts_of_two_speakers_keeps_them_apart(store, sid, monkeypatch):
     gate = threading.Event()
     ai = FakeAI([heard("Birinchi spiker gapi.", speaker="new", complete=True),
@@ -1240,9 +1288,6 @@ def test_new_speaker_id_after_merge_does_not_collide(store, sid):
     assert list(sess.speakers) == ["S1", "S3", "S4"]
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: merge_speakers relabels self.pending and the database, but not a thought "
-                                       "already flushed to unit_queue / being interpreted; its unit is saved under "
-                                       "the merged-away speaker id")
 def test_merge_while_thought_is_being_interpreted(store, sid):
     seed_speaker(store, sid, "S1")
     seed_speaker(store, sid, "S2")
@@ -1268,33 +1313,55 @@ def test_merge_while_thought_is_being_interpreted(store, sid):
 # ---------------------------------------------------------------- notes
 
 
-def test_notes_updated_every_n_units(store, sid, monkeypatch):
-    monkeypatch.setattr(seminar, "NOTES_EVERY_UNITS", 2)
-    ai = FakeAI([heard("a", speaker="new", name="Aziz"), heard("b", speaker="S1"), heard("c", speaker="S1")])
+def test_notes_first_early_then_every_n_units(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "NOTES_FIRST_AFTER_UNITS", 2)
+    monkeypatch.setattr(seminar, "NOTES_EVERY_UNITS", 3)
+    texts = [chr(ord("a") + i) for i in range(6)]
+    ai = FakeAI([heard(t, speaker="new" if i == 0 else "S1", name="Aziz" if i == 0 else "") for i, t in enumerate(texts)])
+    calls_after = []
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
-        await drain(sess)
-        assert ai.notes_calls == [] and sess.notes_task is None
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
-        await drain(sess)
-        assert sess.units_since_notes == 0
-        await sess.add_audio(3, make_wav(2.0), T0 + 6)
-        await drain(sess)
+        for i in range(6):
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await drain(sess)
+            calls_after.append(len(ai.notes_calls))
         sess.close()
         return sess, ws
 
     sess, ws = asyncio.run(main())
+    # no summary yet: the first notes come after NOTES_FIRST_AFTER_UNITS, then every NOTES_EVERY_UNITS
+    assert calls_after == [0, 1, 1, 1, 2, 2]
     expected = {"summary": "Seminar haqida", "glossary": [{"term": "AI", "translation": "SI", "note": ""}]}
-    assert ai.notes_calls == [{"notes": {}, "lines": ["[Aziz] a => T:a", "[Aziz] b => T:b"], "speakers": ["S1 = Aziz"]}]
+    assert ai.notes_calls[0] == {"notes": {}, "lines": ["[Aziz] a => T:a", "[Aziz] b => T:b"],
+                                 "speakers": ["S1 = Aziz"]}
+    assert ai.notes_calls[1]["notes"] == expected
+    assert ai.notes_calls[1]["lines"] == [f"[Aziz] {t} => T:{t}" for t in texts[:5]]  # last 2 * NOTES_EVERY_UNITS
     assert sess.notes == expected and store.session(sid)["notes"] == expected
-    assert ws.of("notes") == [{"type": "notes", "notes": expected}]
+    assert ws.of("notes") == [{"type": "notes", "notes": expected}] * 2
     assert ai.listen_calls[2]["notes"] == expected and ai.interpret_calls[2]["notes"] == expected
-    assert sess.units_since_notes == 1
+    assert ai.listen_calls[1]["notes"] == {}
+
+
+def test_notes_without_summary_keep_the_early_cadence(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "NOTES_FIRST_AFTER_UNITS", 1)
+    monkeypatch.setattr(seminar, "NOTES_EVERY_UNITS", 50)
+    ai = FakeAI([heard("a", speaker="new"), heard("b", speaker="S1")])
+    ai.notes_result = Notes(summary="", glossary=[Term(term="X", translation="Y", note="")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        for i in range(2):
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert len(ai.notes_calls) == 2
 
 
 def test_notes_update_not_started_twice(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "NOTES_FIRST_AFTER_UNITS", 1)
     monkeypatch.setattr(seminar, "NOTES_EVERY_UNITS", 1)
     ai = FakeAI([heard(f"p{i}", speaker="new" if i == 0 else "S1") for i in range(4)])
     ai.notes_gate = threading.Event()
@@ -1304,8 +1371,10 @@ def test_notes_update_not_started_twice(store, sid, monkeypatch):
         try:
             for i in range(3):
                 await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
-            await wait_for(lambda: len(store.units(sid)) == 3 and sess.working == 0)
-            assert len(ai.notes_calls) == 1 and not sess.notes_task.done()
+            await wait_for(lambda: len(store.units(sid)) == 3 and sess.working == 0 and ai.notes_calls)
+            first_task = sess.notes_task
+            await asyncio.sleep(0.05)  # room for a (wrong) second update to show up
+            assert len(ai.notes_calls) == 1 and sess.notes_task is first_task and not first_task.done()
         finally:
             ai.notes_gate.set()
         await sess.notes_task
@@ -1315,7 +1384,7 @@ def test_notes_update_not_started_twice(store, sid, monkeypatch):
 
     asyncio.run(main())
     assert len(ai.notes_calls) == 2
-    assert len(ai.notes_calls[1]["lines"]) == 4
+    assert len(ai.notes_calls[1]["lines"]) == 2  # limit is 2 * NOTES_EVERY_UNITS
 
 
 def test_notes_failure_is_contained(store, sid, monkeypatch):
@@ -1421,18 +1490,21 @@ def ts(hh, mm, ss=0):
 def seed_report_units(store, sid):
     seed_speaker(store, sid, "S1", label="Aziz")
     seed_speaker(store, sid, "S2", label="Spiker 2")
-    store.add_unit(sid, {"start": ts(10, 0), "end": ts(10, 0, 30), "speaker": "S1", "lang": "uz", "target": "uz",
-                         "source": "salom", "translation": "Salom.", "note": ""}, [])
-    store.add_unit(sid, {"start": ts(10, 5), "end": ts(10, 6), "speaker": "S2", "lang": "en", "target": "uz",
-                         "source": "Hello", "translation": "", "note": ""}, [])  # untranslated
+    store.add_unit(sid, {"start": ts(10, 0), "end": ts(10, 0, 30), "speaker": "S1", "lang": "en", "target": "uz",
+                         "source": "Hello everyone", "translation": "Hammaga salom.", "note": ""}, [])
+    store.add_unit(sid, {"start": ts(10, 5), "end": ts(10, 6), "speaker": "S2", "lang": "ru", "target": "uz",
+                         "source": "Привет", "translation": "", "note": ""}, [])  # untranslated
+    store.add_unit(sid, {"start": ts(10, 3), "end": ts(10, 4), "speaker": "S1", "lang": "uz", "target": "uz",
+                         "source": "rahmat", "translation": "Rahmat.", "note": ""}, [])  # cleaned-up Uzbek
 
 
 def test_build_report_without_units_raises(store, sid):
     ai = FakeAI()
-    with pytest.raises(ValueError, match="tarjima qilingan gap yo'q"):
+    assert not issubclass(seminar.ReportRangeError, ValueError)  # unlike a malformed model answer
+    with pytest.raises(seminar.ReportRangeError, match="tarjima qilingan gap yo'q"):
         asyncio.run(build_report(store, ai, sid, 0.0, time.time(), TZ))
     seed_report_units(store, sid)
-    with pytest.raises(ValueError):
+    with pytest.raises(seminar.ReportRangeError):
         asyncio.run(build_report(store, ai, sid, ts(11, 0), ts(12, 0), TZ))
     assert ai.report_calls == [] and store.reports(sid) == []
 
@@ -1450,8 +1522,9 @@ def test_build_report_clamps_period_and_sends_transcript(store, sid):
     assert call["period"] == "2026-10-19 10:00 - 2026-10-19 10:06"
     assert call["speakers"] == "S1: Aziz\nS2: Spiker 2"
     assert call["transcript"].splitlines() == [
-        "[10:00] S1 (Aziz): Salom.  <<uz: salom>>",
-        "[10:05] S2 (Spiker 2): Hello",  # an untranslated unit keeps its original words
+        "[10:00] S1 (Aziz): Hammaga salom.  <<en: Hello everyone>>",
+        "[10:03] S1 (Aziz): Rahmat.",  # Uzbek kept in Uzbek: no need to repeat the source
+        "[10:05] S2 (Spiker 2): Привет",  # an untranslated unit keeps its original words
     ]
 
 
@@ -1461,7 +1534,7 @@ def test_build_report_partial_range_keeps_requested_edges(store, sid):
     report_id = asyncio.run(build_report(store, ai, sid, ts(10, 0, 10), ts(10, 5, 30), TZ))
     row = store.report(report_id)
     assert (row["start"], row["end"]) == (ts(10, 0, 10), ts(10, 5, 30))
-    assert len(ai.report_calls[0]["transcript"].splitlines()) == 2
+    assert len(ai.report_calls[0]["transcript"].splitlines()) == 3
     assert ai.report_calls[0]["period"] == "2026-10-19 10:00 - 2026-10-19 10:05"
 
 

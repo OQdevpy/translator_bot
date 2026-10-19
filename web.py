@@ -28,7 +28,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import report
-from seminar import KEEP_UZBEK, LiveSession, SeminarAI, SeminarStore, build_report, public_speaker
+from seminar import (
+    KEEP_UZBEK,
+    LiveSession,
+    ReportRangeError,
+    SeminarAI,
+    SeminarStore,
+    public_speaker,
+    start_report_job,
+)
 from translator import LANGS, PARTNER_LANGS, Interpreter, Speaker
 from usage import UsageLog
 from voiceprint import Voiceprints
@@ -113,6 +121,8 @@ def create_app(
     secret = secret or secrets.token_bytes(32)
     login_failures: dict[str, tuple[int, float]] = {}  # ip -> (failures, locked until)
     live: dict[int, LiveSession] = {}  # sessions with connected clients or unfinished work
+    report_jobs: set[asyncio.Task] = set()  # keeps background report tasks alive
+    store.fail_unfinished_reports("Server qayta ishga tushdi, hisobotni qaytadan tayyorlang")
 
     def authorized(cookies) -> bool:
         return not password or valid_session(secret, password, cookies.get(COOKIE, ""))
@@ -250,11 +260,11 @@ def create_app(
     def update_session(session_id: int, body: SessionUpdate, request: Request):
         require_auth(request)
         session_or_404(session_id)
+        if body.partner is not None and body.partner not in [KEEP_UZBEK, *PARTNER_LANGS]:
+            raise HTTPException(400, "unknown language")  # before any change, so nothing is half-applied
         if body.title is not None and body.title.strip():
             store.update_session(session_id, title=body.title.strip()[:200])
         if body.partner is not None:
-            if body.partner not in [KEEP_UZBEK, *PARTNER_LANGS]:
-                raise HTTPException(400, "unknown language")
             if session_id in live:
                 live[session_id].set_partner(body.partner)
             else:
@@ -262,23 +272,33 @@ def create_app(
         return {"ok": True}
 
     @app.delete("/api/sessions/{session_id}")
-    def delete_session(session_id: int, request: Request):
+    async def delete_session(session_id: int, request: Request):  # async: LiveSession.close touches the event loop
         require_auth(request)
         session_or_404(session_id)
         sess = live.pop(session_id, None)
         if sess:
             sess.close()
+            for ws in list(sess.clients):  # other devices on this seminar move to another one
+                try:
+                    await ws.close(code=4404)
+                except Exception:
+                    pass
+            sess.clients.clear()
         store.delete_session(session_id)
         return {"ok": True}
+
+    def speaker_ids(session_id: int) -> set[str]:
+        sess = live.get(session_id)
+        return set(sess.speakers) if sess else {sp["id"] for sp in store.speakers(session_id)}
 
     @app.patch("/api/sessions/{session_id}/speakers/{speaker_id}")
     async def rename_speaker(session_id: int, speaker_id: str, body: SpeakerUpdate, request: Request):
         require_auth(request)
         session_or_404(session_id)
         label = body.label.strip()[:80]
-        sess = get_live(session_id)
-        if speaker_id not in sess.speakers or not label:
+        if speaker_id not in speaker_ids(session_id) or not label:
             raise HTTPException(400, "unknown speaker or empty name")
+        sess = get_live(session_id)
         await sess.rename_speaker(speaker_id, label)
         asyncio.create_task(unload_when_idle(sess))
         return {"ok": True}
@@ -287,9 +307,10 @@ def create_app(
     async def merge_speaker(session_id: int, speaker_id: str, body: SpeakerMerge, request: Request):
         require_auth(request)
         session_or_404(session_id)
-        sess = get_live(session_id)
-        if speaker_id == body.into or speaker_id not in sess.speakers or body.into not in sess.speakers:
+        ids = speaker_ids(session_id)
+        if speaker_id == body.into or speaker_id not in ids or body.into not in ids:
             raise HTTPException(400, "unknown speaker")
+        sess = get_live(session_id)
         await sess.merge_speakers(speaker_id, body.into)
         asyncio.create_task(unload_when_idle(sess))
         return {"ok": True}
@@ -305,18 +326,27 @@ def create_app(
         if start >= end:
             raise HTTPException(400, "Boshlanish vaqti tugashdan oldin bo'lishi kerak")
         try:
-            report_id = await build_report(store, ai, session_id, start, end, tz)
-        except ValueError as e:
+            report_id, job = start_report_job(store, ai, session_id, start, end, tz)
+        except ReportRangeError as e:
             raise HTTPException(400, str(e))
-        except Exception:
-            log.exception("Report failed for session %s", session_id)
-            raise HTTPException(502, "Hisobot tayyorlab bo'lmadi, qayta urinib ko'ring")
-        return {"id": report_id}
+        report_jobs.add(job)
+        job.add_done_callback(report_jobs.discard)
+        return {"id": report_id, "status": "pending"}
+
+    @app.get("/api/reports/{report_id:int}/status")
+    def report_status(report_id: int, request: Request):
+        require_auth(request)
+        row = store.report(report_id)
+        if row is None:
+            raise HTTPException(404, "report not found")
+        return {"id": report_id, "status": row["status"], "error": row["error"]}
 
     def report_parts(report_id: int):
         row = store.report(report_id)
         if row is None:
             raise HTTPException(404, "report not found")
+        if row["status"] != "done":
+            raise HTTPException(409, row["error"] or "Hisobot hali tayyor emas")
         session = store.session(row["session_id"])
         units = store.units(row["session_id"], row["start"], row["end"])
         speakers = {sp["id"]: sp["label"] for sp in store.speakers(row["session_id"])}
@@ -336,6 +366,9 @@ def create_app(
     def report_page(report_id: int, request: Request):
         if not authorized(request.cookies):
             return RedirectResponse("/", status_code=303)
+        row = store.report(report_id)
+        if row is not None and row["status"] != "done":
+            return HTMLResponse(report.waiting_page(row), status_code=200 if row["status"] == "pending" else 500)
         return HTMLResponse(report.to_html(*report_parts(report_id), tz))
 
     @app.get("/api/sessions/{session_id}/transcript.txt")
@@ -362,7 +395,7 @@ def create_app(
             await ws.close(code=4403)  # usually a proxy that rewrites Host; the page shows a warning
             return
         session_id = ws.query_params.get("session", "")
-        if not session_id.isdigit() or store.session(int(session_id)) is None:
+        if not session_id.isdigit() or len(session_id) > 18 or store.session(int(session_id)) is None:
             await ws.close(code=4404)
             return
         sess = get_live(int(session_id))

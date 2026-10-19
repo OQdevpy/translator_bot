@@ -31,7 +31,7 @@ KEEP_UZBEK = "uz"  # partner setting: leave Uzbek speech in Uzbek
 SAME_VOICE = 0.62  # voiceprint similarity above which it is surely the same person
 NEW_VOICE = 0.45  # below this for every known speaker it is surely someone new
 MAX_REFERENCE_SPEAKERS = 6  # reference recordings sent to Gemini with each phrase
-GOOD_REFERENCE_SECONDS = (4.0, 10.0)
+GOOD_REFERENCE_SECONDS = (4.0, 8.0)
 UNIT_MAX_SECONDS = 25.0  # interpret even if the speaker hasn't finished the thought by then
 IDLE_FLUSH_SECONDS = 4.0  # ...or after this long without new speech
 NOTES_FIRST_AFTER_UNITS = 4  # early notes help with names and terms from the start
@@ -60,7 +60,7 @@ You get reference recordings of the speakers identified so far, then a NEW SEGME
 6. complete: true if the segment ends at the end of a sentence or complete thought; false if the
    speaker stopped mid-sentence and will clearly continue.
 
-Seminar notes (use these spellings for names and terms):
+Terminology (use these spellings for names and terms):
 {notes}
 
 Recent transcript (oldest first):
@@ -206,7 +206,9 @@ class SeminarAI:
         contents += ["NEW SEGMENT:", types.Part.from_bytes(data=wav, mime_type="audio/wav")]
         sims = "\n".join(f"   - {sid}: {score:.2f}" for sid, score in similarities.items()) or "   (not available)"
         system = LISTEN_PROMPT.format(
-            similarities=sims, notes=notes_text(notes), recent="\n".join(recent) or "(nothing yet)"
+            similarities=sims,
+            notes=notes_text({"glossary": notes.get("glossary")}),
+            recent="\n".join(recent) or "(nothing yet)",
         )
         heard = self.interpreter.generate(contents, system, Heard, temperature=0.1)
         heard.text = heard.text.strip()
@@ -262,8 +264,14 @@ CREATE TABLE IF NOT EXISTS units (
 CREATE INDEX IF NOT EXISTS units_session ON units (session_id, start);
 CREATE TABLE IF NOT EXISTS reports (
     id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, created_at REAL NOT NULL,
-    start REAL NOT NULL, end REAL NOT NULL, report TEXT NOT NULL);
+    start REAL NOT NULL, end REAL NOT NULL, report TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'done', error TEXT NOT NULL DEFAULT '');
 """
+MAX_ID = 2**63 - 1  # SQLite INTEGER range; larger ids can't exist
+
+
+class ReportRangeError(Exception):
+    """The chosen time range can't be reported on (nothing said, or too long for one report)."""
 
 
 def pack(vec: np.ndarray | None) -> bytes | None:
@@ -303,6 +311,8 @@ class SeminarStore:
         return self.session(sid)
 
     def session(self, session_id: int) -> dict | None:
+        if not 0 < session_id <= MAX_ID:
+            return None
         rows = self._all("SELECT * FROM sessions WHERE id = ?", (session_id,))
         if not rows:
             return None
@@ -338,8 +348,10 @@ class SeminarStore:
 
     def save_speaker(self, session_id: int, sp: dict):
         self._write(
-            "INSERT OR REPLACE INTO speakers (session_id, id, label, named, voice, ref_wav, ref_seconds, centroid, samples) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO speakers (session_id, id, label, named, voice, ref_wav, ref_seconds, centroid, samples) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (session_id, id) DO UPDATE SET label = excluded.label, "
+            "named = excluded.named, voice = excluded.voice, ref_wav = excluded.ref_wav, "
+            "ref_seconds = excluded.ref_seconds, centroid = excluded.centroid, samples = excluded.samples",
             (session_id, sp["id"], sp["label"], int(sp["named"]), sp["voice"], sp["ref_wav"], sp["ref_seconds"],
              pack(sp["centroid"]), sp["samples"]),
         )
@@ -397,12 +409,34 @@ class SeminarStore:
             (session_id, time.time(), start, end, json.dumps(report, ensure_ascii=False)),
         )
 
+    def start_report(self, session_id: int, start: float, end: float) -> int:
+        return self._write(
+            "INSERT INTO reports (session_id, created_at, start, end, report, status) VALUES (?, ?, ?, ?, '{}', 'pending')",
+            (session_id, time.time(), start, end),
+        )
+
+    def finish_report(self, report_id: int, report: dict):
+        self._write(
+            "UPDATE reports SET report = ?, status = 'done' WHERE id = ?",
+            (json.dumps(report, ensure_ascii=False), report_id),
+        )
+
+    def fail_report(self, report_id: int, error: str):
+        self._write("UPDATE reports SET status = 'failed', error = ? WHERE id = ?", (error, report_id))
+
+    def fail_unfinished_reports(self, error: str):
+        """Reports that were being written when the server stopped will never finish."""
+        self._write("UPDATE reports SET status = 'failed', error = ? WHERE status = 'pending'", (error,))
+
     def reports(self, session_id: int) -> list[dict]:
         return self._all(
-            "SELECT id, created_at, start, end FROM reports WHERE session_id = ? ORDER BY created_at DESC", (session_id,)
+            "SELECT id, created_at, start, end, status, error FROM reports WHERE session_id = ? ORDER BY created_at DESC",
+            (session_id,),
         )
 
     def report(self, report_id: int) -> dict | None:
+        if not 0 < report_id <= MAX_ID:
+            return None
         rows = self._all("SELECT * FROM reports WHERE id = ?", (report_id,))
         if not rows:
             return None
@@ -435,7 +469,9 @@ class LiveSession:
         self.partner = row["partner"]
         self.notes = row["notes"]
         self.speakers = {sp["id"]: sp for sp in store.speakers(session_id)}
-        self.pending = store.pending_segments(session_id)  # phrases of the thought in progress
+        self.merged: dict[str, str] = {}  # merged-away speaker id -> the one it became
+        self.pending: list[dict] = []  # phrases of the thought in progress
+        restored = self._regroup(store.pending_segments(session_id))
         self.recent_lines: deque[str] = deque(maxlen=8)
         self.recent_units: deque[str] = deque(
             (f"[{self.label(u['speaker'])}] {u['translation']}" for u in store.units(session_id, limit=RECENT_UNITS)),
@@ -443,6 +479,7 @@ class LiveSession:
         )
         self.units_since_notes = 0
         self.working = 0  # phrases or thoughts being processed right now
+        self.listening = 0  # phrases being transcribed right now
         self.interpreting = 0  # thoughts being interpreted right now
         self.clients: set = set()
         self.listen_queue: asyncio.Queue = asyncio.Queue()
@@ -453,13 +490,35 @@ class LiveSession:
             asyncio.create_task(self._listen_worker()),
             asyncio.create_task(self._interpret_worker()),
         ]
-        if self.pending:  # left over from before a restart
+        for thought in restored:  # left over from before a restart
+            self.unit_queue.put_nowait(thought)
+        if self.pending:
             self._arm_idle_flush()
+
+    def _regroup(self, segments: list[dict]) -> list[list[dict]]:
+        """Splits stored, not yet interpreted phrases back into thoughts; the unfinished tail becomes pending."""
+        thoughts, current = [], []
+        for seg in segments:
+            if current and current[0]["speaker"] != seg["speaker"]:
+                thoughts.append(current)
+                current = []
+            current.append(seg)
+            if seg["complete"]:
+                thoughts.append(current)
+                current = []
+        self.pending = current
+        return thoughts
 
     # --- helpers
     def label(self, speaker_id: str) -> str:
-        sp = self.speakers.get(speaker_id)
+        sp = self.speakers.get(self.resolve(speaker_id))
         return sp["label"] if sp else speaker_id
+
+    def resolve(self, speaker_id: str) -> str:
+        """Follows merges, for thoughts that were already on their way when the speakers were merged."""
+        while speaker_id in self.merged:
+            speaker_id = self.merged[speaker_id]
+        return speaker_id
 
     def busy(self) -> bool:
         return bool(self.pending) or self.working > 0 or not self.listen_queue.empty() or not self.unit_queue.empty()
@@ -508,10 +567,12 @@ class LiveSession:
         while True:
             client_id, wav, received = await self.listen_queue.get()
             self.working += 1
+            self.listening += 1
             try:
                 await self._listen_with_retry(client_id, wav, received)
             finally:
                 self.working -= 1
+                self.listening -= 1
 
     async def _listen_with_retry(self, client_id: int, wav: bytes, received: float):
         for attempt in (1, 2):
@@ -535,7 +596,11 @@ class LiveSession:
         sims = {}
         if embedding is not None:
             sims = {sid: cosine(embedding, sp["centroid"]) for sid, sp in self.speakers.items() if sp["centroid"] is not None}
-        references = self._references(sims)
+        # Reference recordings are most of the cost of a phrase: send them only when the voiceprints can't decide.
+        best = max(sims.values(), default=0.0)
+        unknown_voice = any(sp["centroid"] is None for sp in self.speakers.values())
+        decided = sims and (best >= SAME_VOICE or (best < NEW_VOICE and not unknown_voice))
+        references = [] if decided else self._references(sims)
         heard = await asyncio.to_thread(
             self.ai.listen, wav, references, {sid: sims[sid] for sid in sims}, list(self.recent_lines), self.notes
         )
@@ -574,14 +639,14 @@ class LiveSession:
 
     def _idle_flush(self):
         self.idle_timer = None
-        if self.listen_queue.empty():  # more speech is already waiting: let it complete the thought
+        if self.listen_queue.empty() and self.listening == 0:
             self.flush()
-        else:
+        else:  # more speech is on its way: let it complete the thought
             self._arm_idle_flush()
 
     def _references(self, sims: dict) -> list[dict]:
-        """The most likely speakers' recordings, so Gemini can compare voices."""
-        ranked = sorted(self.speakers.values(), key=lambda sp: -sims.get(sp["id"], 0))
+        """The most likely speakers' recordings, so Gemini can compare voices (unknown similarity ranks mid-way)."""
+        ranked = sorted(self.speakers.values(), key=lambda sp: -sims.get(sp["id"], (SAME_VOICE + NEW_VOICE) / 2))
         return [sp for sp in ranked if sp["ref_wav"]][:MAX_REFERENCE_SPEAKERS]
 
     async def _resolve_speaker(self, heard: Heard, sims: dict, embedding, wav: bytes, seconds: float) -> str:
@@ -596,7 +661,8 @@ class LiveSession:
             confident = gemini_id is not None and gemini_id == best_id
         changed = False
         if speaker_id is None:
-            n = 1 + max([int(s[1:]) for s in self.speakers if s[1:].isdigit()] or [0])
+            used = [*self.speakers, *self.merged]  # never reissue a merged-away id
+            n = 1 + max([int(s[1:]) for s in used if s[1:].isdigit()] or [0])
             sp = {"id": f"S{n}", "label": heard.speaker_name or f"Spiker {n}", "named": bool(heard.speaker_name),
                   "voice": heard.voice, "ref_wav": wav, "ref_seconds": seconds, "centroid": embedding,
                   "samples": 1 if embedding is not None else 0}
@@ -637,7 +703,7 @@ class LiveSession:
                 await self.broadcast_pending()
 
     async def _interpret(self, segments: list[dict]):
-        speaker_id = segments[0]["speaker"]
+        speaker_id = self.resolve(segments[0]["speaker"])
         lang = Counter(s["lang"] for s in segments).most_common(1)[0][0]
         target = self.partner if lang == "uz" and self.partner != KEEP_UZBEK else "uz"
         source = " ".join(s["text"] for s in segments)
@@ -652,6 +718,7 @@ class LiveSession:
                 log.exception("Interpreting failed in session %s (attempt %d)", self.id, attempt)
                 if attempt == 1:
                     await asyncio.sleep(RETRY_DELAY)
+        speaker_id = self.resolve(speaker_id)  # the speakers may have been merged meanwhile
         unit = self.store.add_unit(
             self.id,
             {"start": segments[0]["start"], "end": segments[-1]["end"], "speaker": speaker_id, "lang": lang,
@@ -695,6 +762,10 @@ class LiveSession:
                 total = dst["samples"] + src["samples"]
                 dst["centroid"] = (dst["centroid"] * dst["samples"] + src["centroid"] * src["samples"]) / max(total, 1)
                 dst["samples"] = total
+        self.merged[source] = target
+        for old, new in self.merged.items():
+            if new == source:
+                self.merged[old] = target
         self.store.merge_speakers(self.id, source, target)
         self.store.save_speaker(self.id, dst)
         for seg in self.pending:
@@ -721,20 +792,47 @@ def transcript_lines(units: list[dict], speakers: dict[str, str], tz: ZoneInfo, 
     return lines
 
 
-async def build_report(store: SeminarStore, ai: SeminarAI, session_id: int, start: float, end: float, tz: ZoneInfo) -> int:
+REPORT_SOURCE_LIMIT = 600_000  # characters of transcript; above it the original-language text is left out
+REPORT_MAX_CHARS = 2_400_000  # about 600k tokens: more than one report can hold
+
+
+def report_input(store: SeminarStore, session_id: int, start: float, end: float, tz: ZoneInfo) -> tuple[str, str, str, float, float]:
+    """Transcript, speaker list and period for a report; raises ReportRangeError if it can't be made."""
     units = store.units(session_id, start, end)
     if not units:
-        raise ValueError("Bu oraliqda tarjima qilingan gap yo'q")
+        raise ReportRangeError("Bu oraliqda tarjima qilingan gap yo'q")
     # the report covers what was actually said, not the empty edges of the chosen range
     start, end = max(start, units[0]["start"]), min(end, max(u["end"] for u in units))
     speakers = {sp["id"]: sp["label"] for sp in store.speakers(session_id)}
-    period = (
-        f"{datetime.fromtimestamp(start, tz):%Y-%m-%d %H:%M} - {datetime.fromtimestamp(end, tz):%Y-%m-%d %H:%M}"
-    )
-    report = await asyncio.to_thread(
-        ai.report,
-        "\n".join(transcript_lines(units, speakers, tz)),
-        "\n".join(f"{sid}: {label}" for sid, label in speakers.items()),
-        period,
-    )
+    transcript = "\n".join(transcript_lines(units, speakers, tz))
+    if len(transcript) > REPORT_SOURCE_LIMIT:
+        transcript = "\n".join(transcript_lines(units, speakers, tz, with_source=False))
+    if len(transcript) > REPORT_MAX_CHARS:
+        raise ReportRangeError("Oraliq bitta hisobot uchun juda katta, qisqaroq vaqtni tanlang")
+    period = f"{datetime.fromtimestamp(start, tz):%Y-%m-%d %H:%M} - {datetime.fromtimestamp(end, tz):%Y-%m-%d %H:%M}"
+    roster = "\n".join(f"{sid}: {label}" for sid, label in speakers.items())
+    return transcript, roster, period, start, end
+
+
+async def build_report(store: SeminarStore, ai: SeminarAI, session_id: int, start: float, end: float, tz: ZoneInfo) -> int:
+    """Writes the report right away (used by tests and scripts); the web app uses start_report_job."""
+    transcript, roster, period, start, end = report_input(store, session_id, start, end, tz)
+    report = await asyncio.to_thread(ai.report, transcript, roster, period)
     return store.save_report(session_id, start, end, report.model_dump())
+
+
+def start_report_job(store: SeminarStore, ai: SeminarAI, session_id: int, start: float, end: float, tz: ZoneInfo) -> tuple[int, asyncio.Task]:
+    """Reports on a long seminar take a minute or two, longer than proxies wait for a response:
+    the report is stored as pending at once and written in the background."""
+    transcript, roster, period, start, end = report_input(store, session_id, start, end, tz)
+    report_id = store.start_report(session_id, start, end)
+
+    async def run():
+        try:
+            report = await asyncio.to_thread(ai.report, transcript, roster, period)
+            store.finish_report(report_id, report.model_dump())
+        except Exception:
+            log.exception("Report %s failed", report_id)
+            store.fail_report(report_id, "Hisobot tayyorlab bo'lmadi, qayta urinib ko'ring")
+
+    return report_id, asyncio.create_task(run())

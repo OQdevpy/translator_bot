@@ -481,14 +481,16 @@ function renderReports(reports) {
   ui.reportsList.replaceChildren(
     ...reports.map((r) => {
       const li = el("li");
-      const a = el("a", "item", `📄 ${clock(r.start)}–${clock(r.end)} · ${new Date(r.created_at * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}`);
+      const icon = r.status === "pending" ? "⏳" : r.status === "failed" ? "⚠️" : "📄";
+      const a = el("a", "item", `${icon} ${clock(r.start)}–${clock(r.end)} · ${new Date(r.created_at * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}`);
       a.href = `/api/reports/${r.id}`;
       a.target = "_blank";
       const md = el("a", "icon small", "MD");
       md.href = `/api/reports/${r.id}.md`;
       md.title = "Markdown yuklab olish";
       md.setAttribute("download", "");
-      li.append(a, md);
+      li.append(a);
+      if (r.status === "done") li.append(md);
       return li;
     }),
   );
@@ -520,9 +522,16 @@ ui.reportMake.addEventListener("click", async () => {
   ui.reportStatus.textContent = "⏳ Hisobot tayyorlanmoqda… (uzun seminar uchun 1–2 daqiqa)";
   try {
     const { id } = await api(`/api/sessions/${session.id}/reports`, { method: "POST", body: { start, end } });
+    let status = { status: "pending" };
+    while (status.status === "pending") {
+      // written in the background: a whole day can take a minute or two
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      status = await api(`/api/reports/${id}/status`);
+    }
     const data = await api(`/api/sessions/${session.id}`);
     session.reports = data.reports;
     renderReports(data.reports);
+    if (status.status === "failed") throw new Error(status.error);
     ui.reportStatus.textContent = "";
     const link = el("a", null, "✅ Tayyor — hisobotni ochish");
     link.href = `/api/reports/${id}`;

@@ -17,6 +17,11 @@ def _name(speaker_id: str, speakers: dict[str, str]) -> str:
     return speakers.get(speaker_id, speaker_id)
 
 
+def _cell(text: str) -> str:
+    """Markdown table cell: one line, pipes escaped."""
+    return " ".join(str(text).split()).replace("|", "\\|")
+
+
 def transcript_text(units: list[dict], speakers: dict[str, str], tz: ZoneInfo) -> str:
     """Speaker turns with times; consecutive units of one speaker form one paragraph."""
     out, last = [], None
@@ -44,7 +49,7 @@ def to_markdown(row: dict, session: dict, units: list[dict], speakers: dict[str,
             md += [f"- {p}" for p in s["key_points"]] + [""]
     if r["timeline"]:
         md += ["## Xronologiya", "", "| Vaqt | Kim | Nima bo'ldi |", "|---|---|---|"]
-        md += [f"| {e['time']} | {sp(e['speaker_id'])} | {e['event']} |" for e in r["timeline"]] + [""]
+        md += [f"| {_cell(e['time'])} | {_cell(sp(e['speaker_id']))} | {_cell(e['event'])} |" for e in r["timeline"]] + [""]
     if r["topics"]:
         md += ["## Asosiy mavzular", ""]
         md += [f"- **{t['title']}.** {t['summary']}" for t in r["topics"]] + [""]
@@ -58,7 +63,7 @@ def to_markdown(row: dict, session: dict, units: list[dict], speakers: dict[str,
             md += [f"## {title}", ""] + [f"- {i}" for i in items] + [""]
     if r["glossary"]:
         md += ["## Atamalar lug'ati", "", "| Atama | O'zbekcha | Izoh |", "|---|---|---|"]
-        md += [f"| {g['term']} | {g['translation']} | {g['note']} |" for g in r["glossary"]] + [""]
+        md += [f"| {_cell(g['term'])} | {_cell(g['translation'])} | {_cell(g['note'])} |" for g in r["glossary"]] + [""]
     md += ["## To'liq transkript", "", "```", transcript_text(units, speakers, tz).rstrip(), "```", ""]
     return "\n".join(md)
 
@@ -154,3 +159,16 @@ def to_html(row: dict, session: dict, units: list[dict], speakers: dict[str, str
         parts.append("</div>")
     parts.append("</main></body></html>")
     return "".join(parts)
+
+
+def waiting_page(row: dict) -> str:
+    """Shown while a report is still being written (refreshes itself) or when it failed."""
+    if row["status"] == "pending":
+        head, body = "<meta http-equiv='refresh' content='3'>", "⏳ Hisobot tayyorlanmoqda… Sahifa o'zi yangilanadi."
+    else:
+        head, body = "", f"⚠️ {html.escape(row['error'] or 'Hisobot tayyorlab bo`lmadi')}"
+    return (
+        f"<!doctype html><html lang='uz'><head><meta charset='utf-8'>{head}"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        f"<title>Hisobot</title><style>{CSS}</style></head><body><main><h1>Hisobot</h1><p>{body}</p></main></body></html>"
+    )
