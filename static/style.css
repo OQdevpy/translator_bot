@@ -58,7 +58,6 @@ button, select, input { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--border);
 }
 
-header h1 { margin: 0; font-size: 1.1rem; flex: 1; }
 
 .status { font-size: 0.85rem; color: var(--muted); display: flex; align-items: center; gap: 6px; }
 .status::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
@@ -106,14 +105,17 @@ select {
   gap: 10px;
 }
 
+.earlier { text-align: center; margin: 0; font-size: 0.85rem; }
 .placeholder { margin: auto; max-width: 520px; text-align: center; color: var(--muted); }
 .placeholder .big { font-size: 1.15rem; color: var(--text); }
 .muted { color: var(--muted); font-size: 0.85rem; }
 
-.card {
+.turn {
+  --c: var(--accent);
   background: var(--panel);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-left: 4px solid var(--c);
+  border-radius: 12px;
   padding: 10px 14px;
   box-shadow: var(--shadow);
   animation: appear 0.2s ease-out;
@@ -121,16 +123,101 @@ select {
 
 @keyframes appear { from { opacity: 0; transform: translateY(6px); } }
 
-.card .line { display: flex; gap: 8px; align-items: baseline; }
-.card .flag { flex: none; }
-.card .orig { color: var(--muted); font-size: 0.92rem; }
-.card .trans { font-size: 1.2rem; font-weight: 600; margin-top: 4px; }
-.card .text { overflow-wrap: anywhere; }
-.card.pending .trans { color: var(--muted); font-weight: 400; font-size: 1rem; }
-.card.pending .trans .text::after { content: "…"; animation: dots 1s steps(3) infinite; }
-.card.error .trans { color: var(--error); font-weight: 400; font-size: 0.95rem; }
+.turn header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.turn time { color: var(--muted); font-size: 0.8rem; }
+
+.who, .who-chip {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--c);
+  font-weight: 700;
+  font-size: 0.92rem;
+  cursor: pointer;
+}
+
+.who:hover { text-decoration: underline; }
+.unit { animation: appear 0.2s ease-out; }
+.unit + .unit { margin-top: 6px; }
+.unit p { margin: 0; overflow-wrap: anywhere; }
+.unit .tr { font-size: 1.15rem; line-height: 1.5; }
+.unit .note { color: var(--muted); font-size: 0.85rem; font-style: italic; margin-top: 2px; }
+.unit .src { display: none; color: var(--muted); font-size: 0.85rem; margin-top: 2px; }
+.show-src .unit .src { display: block; }
+.unit.untranslated .tr { color: var(--muted); }
+
+.live {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px dashed var(--border);
+  background: var(--panel);
+  font-size: 0.92rem;
+  color: var(--muted);
+  max-height: 4.6em;
+  overflow: hidden;
+}
+
+.live-text { flex: 1; overflow-wrap: anywhere; }
+.live-text::after { content: " …"; animation: dots 1s steps(3) infinite; }
+.live-busy { white-space: nowrap; }
 
 @keyframes dots { 0% { opacity: 0.2; } 50% { opacity: 1; } }
+
+.context { margin: 8px 16px 0; padding: 8px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel); font-size: 0.9rem; }
+.context summary { cursor: pointer; color: var(--muted); }
+.context p { margin: 8px 0 4px; }
+.terms { margin: 4px 0 0; padding-left: 18px; color: var(--muted); }
+
+.session-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border: 0;
+  background: none;
+  font-size: 1.05rem;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+  padding: 0;
+}
+
+.session-title #session-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-title .caret { color: var(--muted); font-size: 0.8rem; }
+
+dialog.dialog {
+  width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+dialog::backdrop { background: rgb(15 23 42 / 0.45); }
+.dialog-head { display: flex; align-items: center; justify-content: space-between; margin: 0 0 8px; }
+.dialog-head h2 { margin: 0; font-size: 1.1rem; }
+.dialog h3 { font-size: 0.95rem; margin: 16px 0 6px; }
+.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: flex-end; margin: 8px 0; }
+.row label { display: flex; flex-direction: column; gap: 4px; flex: 1 1 200px; font-size: 0.85rem; color: var(--muted); }
+.row input, .row select { flex: 1 1 200px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg); min-width: 0; }
+.dialog button { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); cursor: pointer; }
+.dialog button.primary, .primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+.dialog button:disabled { opacity: 0.6; cursor: wait; }
+.wide { width: 100%; margin-top: 4px; }
+.presets { display: flex; flex-wrap: wrap; gap: 6px; }
+.presets button { font-size: 0.85rem; padding: 6px 10px; }
+.list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.list li { display: flex; gap: 6px; align-items: center; }
+.list li.current .item { border-color: var(--accent); }
+.list .item { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); color: var(--text); text-align: left; text-decoration: none; cursor: pointer; }
+.list .item b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.list .item .muted { font-size: 0.8rem; }
+.icon.small { width: 34px; height: 34px; font-size: 0.85rem; display: inline-flex; align-items: center; justify-content: center; text-decoration: none; color: var(--text); padding: 0; }
 
 .controls { justify-content: space-between; border-top: 1px solid var(--border); border-bottom: 0; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
 
@@ -191,5 +278,5 @@ body.login { align-items: center; justify-content: center; padding: 16px; }
 @media (max-width: 520px) {
   .settings select { min-width: 0; width: 100%; }
   .settings label { flex: 1 1 140px; }
-  .card .trans { font-size: 1.12rem; }
+  .unit .tr { font-size: 1.08rem; }
 }

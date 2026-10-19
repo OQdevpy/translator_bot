@@ -2,20 +2,45 @@ import { Downsampler, SAMPLE_RATE, Segmenter, encodeWav, packSegment } from "./a
 
 const $ = (id) => document.getElementById(id);
 const ui = {
+  sessionsBtn: $("sessions-btn"),
+  title: $("session-title"),
   status: $("status"),
   source: $("source"),
   partner: $("partner"),
+  showSrc: $("show-src"),
   tts: $("tts"),
   ttsLabel: $("tts-label"),
+  context: $("context"),
+  contextSummary: $("context-summary"),
+  contextTerms: $("context-terms"),
   warning: $("warning"),
   transcript: $("transcript"),
   placeholder: $("placeholder"),
+  live: $("live"),
+  liveWho: $("live-who"),
+  liveText: $("live-text"),
+  liveBusy: $("live-busy"),
   toggle: $("toggle"),
   level: $("level"),
   hint: $("hint"),
   copy: $("copy"),
-  clear: $("clear"),
+  reportBtn: $("report-btn"),
   logout: $("logout"),
+  sessionsDialog: $("sessions-dialog"),
+  sessionsList: $("sessions-list"),
+  newSession: $("new-session"),
+  newTitle: $("new-title"),
+  reportDialog: $("report-dialog"),
+  reportStart: $("report-start"),
+  reportEnd: $("report-end"),
+  reportMake: $("report-make"),
+  reportStatus: $("report-status"),
+  reportsList: $("reports-list"),
+  speakerDialog: $("speaker-dialog"),
+  speakerName: $("speaker-name"),
+  speakerRename: $("speaker-rename"),
+  speakerMerge: $("speaker-merge"),
+  mergeInto: $("merge-into"),
 };
 
 const store = {
@@ -27,18 +52,105 @@ const store = {
   },
 };
 
+const COLORS = ["#2563eb", "#db2777", "#059669", "#d97706", "#7c3aed", "#0891b2", "#dc2626", "#4d7c0f"];
+const MAX_TURNS_ON_PAGE = 300; // older parts stay in the report
+const SAME_TURN_GAP_S = 300; // a speaker's units closer than this join one block
+const MAX_REPLAY = 5; // after a reconnect, only the newest unsent phrases are still worth sending
+const MAX_REPLAY_AGE_MS = 30000;
+
 let config = null;
+let session = null; // {id, title, created_at, partner, notes, units, reports}
+const speakers = new Map(); // id -> {id, label, voice}
+const shownUnits = new Set();
+let lastTurn = null; // {el, speaker, end}
 let ws = null;
 let reconnectDelay = 1000;
-let capture = null; // {ctx, stream, segmenter, paused}
+let capture = null; // {ctx, stream, segmenter, paused, hearsOutput}
 let seq = 0;
-const pending = new Map(); // segment id -> {card, frame, sent}
+const outbox = []; // phrases recorded while offline: {frame, at}
+let listening = 0; // phrases sent and not answered yet
 const player = new Audio();
 const speechQueue = [];
 let speaking = false;
 let wakeLock = null;
-const MAX_REPLAY = 5; // after a reconnect, only the newest unsent segments are still worth translating
-const MAX_REPLAY_AGE_MS = 30000;
+let editingSpeaker = null;
+
+// ---------- api ----------
+
+async function api(path, options = {}) {
+  const res = await fetch(path, {
+    ...options,
+    headers: options.body ? { "Content-Type": "application/json" } : undefined,
+    body: options.body ? JSON.stringify(options.body) : undefined,
+  });
+  if (res.status === 401) {
+    location.reload();
+    throw new Error("login required");
+  }
+  if (!res.ok) {
+    let detail = `${res.status}`;
+    try {
+      detail = (await res.json()).detail || detail;
+    } catch {}
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+// ---------- session ----------
+
+async function openSession(id) {
+  const data = await api(`/api/sessions/${id}`);
+  session = data;
+  store.set("session", String(id));
+  ui.title.textContent = data.title;
+  document.title = `${data.title} · Jonli tarjimon`;
+  ui.partner.value = data.partner;
+  speakers.clear();
+  data.speakers.forEach((sp) => speakers.set(sp.id, sp));
+  shownUnits.clear();
+  lastTurn = null;
+  ui.transcript.querySelectorAll(".turn, .earlier").forEach((el) => el.remove());
+  if (data.units.length >= data.units_on_page) {
+    // long seminars: only the newest part is on the page, all of it is in the reports
+    ui.transcript.prepend(el("p", "earlier muted", "… avvalgi qismlar 📄 hisobotda"));
+  }
+  data.units.forEach((u) => addUnit(u, false));
+  showNotes(data.notes);
+  showPending(data.pending, 0);
+  updatePlaceholder();
+  ui.transcript.scrollTop = ui.transcript.scrollHeight;
+  connect();
+}
+
+async function chooseInitialSession() {
+  const saved = Number(store.get("session"));
+  if (saved) {
+    try {
+      await openSession(saved);
+      return;
+    } catch {}
+  }
+  const list = await api("/api/sessions");
+  const today = new Date().toDateString();
+  const recent = list.find((s) => new Date(s.created_at * 1000).toDateString() === today);
+  await openSession(recent ? recent.id : (await api("/api/sessions", { method: "POST", body: {} })).id);
+}
+
+function showNotes(notes) {
+  const terms = notes?.glossary || [];
+  ui.context.hidden = !notes?.summary && !terms.length;
+  ui.contextSummary.textContent = notes?.summary || "";
+  ui.contextTerms.replaceChildren(
+    ...terms.map((t) => {
+      const li = document.createElement("li");
+      const b = document.createElement("b");
+      b.textContent = t.term;
+      li.append(b, ` — ${t.translation}${t.note ? ` (${t.note})` : ""}`);
+      return li;
+    }),
+  );
+}
 
 // ---------- connection ----------
 
@@ -48,131 +160,187 @@ function setStatus(state, text) {
 }
 
 function connect() {
+  if (ws) {
+    ws.onclose = null;
+    ws.close();
+  }
+  const sessionId = session.id;
   setStatus("connecting", "Ulanmoqda…");
-  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
-  ws.binaryType = "arraybuffer";
-  ws.onopen = () => {
+  const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?session=${sessionId}`);
+  ws = socket;
+  socket.binaryType = "arraybuffer";
+  socket.onopen = () => {
     reconnectDelay = 1000;
     setStatus("online", "Ulangan");
-    sendConfig();
-    const unsent = [...pending].filter(([, item]) => !item.sent);
-    unsent.forEach(([id, item], i) => {
-      if (i < unsent.length - MAX_REPLAY || Date.now() - item.at > MAX_REPLAY_AGE_MS) {
-        fail(id, "Aloqa yo'q edi");
-      } else {
-        item.replayed = true; // translate late, but don't read it aloud
-        send(item);
-      }
-    });
+    const fresh = outbox.splice(0).filter((item, i, all) => i >= all.length - MAX_REPLAY && Date.now() - item.at < MAX_REPLAY_AGE_MS);
+    fresh.forEach((item) => send(item.frame));
   };
-  ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
-  ws.onclose = (event) => {
+  socket.onmessage = (event) => handleMessage(JSON.parse(event.data));
+  socket.onclose = (event) => {
+    if (ws !== socket) return;
     setStatus("offline", "Aloqa yo'q");
+    listening = 0;
     if (event.code === 4401) {
       location.reload(); // session expired: show the login page
       return;
     }
     if (event.code === 4403) {
       showWarning(
-        "Server ulanishni rad etdi: Origin va Host mos emas. nginx bo'lsa, " +
-          "proxy_set_header Host $http_host; qatorini qo'shing.",
+        "Server ulanishni rad etdi: Origin va Host mos emas. nginx bo'lsa, proxy_set_header Host $http_host; qatorini qo'shing.",
       );
-      return; // reconnecting would be rejected the same way
+      return;
     }
-    // Segments the server had not answered are lost with the connection.
-    for (const [id, item] of pending) {
-      if (item.sent) fail(id, "Aloqa uzildi");
+    if (event.code === 4404) {
+      store.set("session", "");
+      chooseInitialSession();
+      return;
     }
-    setTimeout(connect, reconnectDelay);
+    setTimeout(() => {
+      if (ws === socket) connect();
+    }, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 15000);
   };
 }
 
-function sendConfig() {
-  if (ws?.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: "config", partner: ui.partner.value }));
-  }
-}
-
-function send(item) {
-  if (ws?.readyState !== WebSocket.OPEN) return;
-  ws.send(item.frame);
-  item.sent = true;
+function send(frame) {
+  if (ws?.readyState !== WebSocket.OPEN) return false;
+  ws.send(frame);
+  listening++;
+  updateHint();
+  return true;
 }
 
 function handleMessage(msg) {
-  if (msg.type === "result") {
-    const item = pending.get(msg.id);
-    if (!item) return;
-    pending.delete(msg.id);
-    fillCard(item.card, msg);
-    if (ui.tts.checked && config.tts && !item.replayed) speak(msg.translation);
-  } else if (msg.type === "empty") {
-    pending.get(msg.id)?.card.remove();
-    pending.delete(msg.id);
-    updatePlaceholder();
-  } else if (msg.type === "error") {
-    if (msg.id == null) showWarning(msg.message);
-    else fail(msg.id, msg.message);
+  switch (msg.type) {
+    case "heard":
+    case "empty":
+      listening = Math.max(0, listening - 1);
+      updateHint();
+      break;
+    case "pending":
+      showPending(msg.pending, msg.interpreting);
+      break;
+    case "unit":
+      addUnit(msg.unit, true);
+      break;
+    case "speaker":
+      speakers.set(msg.speaker.id, msg.speaker);
+      relabel(msg.speaker.id);
+      break;
+    case "merged":
+      openSession(session.id); // simplest way to regroup the blocks
+      break;
+    case "notes":
+      showNotes(msg.notes);
+      break;
+    case "error":
+      if (msg.id != null) listening = Math.max(0, listening - 1);
+      updateHint();
+      showWarning(msg.message);
+      setTimeout(() => showWarning(""), 6000);
+      break;
   }
 }
 
 // ---------- transcript ----------
 
+function speakerIndex(id) {
+  const n = parseInt(String(id).slice(1), 10);
+  return Number.isFinite(n) ? n - 1 : 0;
+}
+
+function colorOf(id) {
+  return COLORS[speakerIndex(id) % COLORS.length];
+}
+
+function labelOf(id) {
+  return speakers.get(id)?.label || id;
+}
+
 function flagOf(code) {
   return config.langs[code]?.flag ?? "🌐";
 }
 
-function line(cls, flag, text) {
-  const div = document.createElement("div");
-  div.className = `line ${cls}`;
-  const f = document.createElement("span");
-  f.className = "flag";
-  f.textContent = flag;
-  const t = document.createElement("span");
-  t.className = "text";
-  t.textContent = text;
-  div.append(f, t);
-  return div;
+function clock(ts) {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+function el(tag, cls, text) {
+  const node = document.createElement(tag);
+  if (cls) node.className = cls;
+  if (text != null) node.textContent = text;
+  return node;
 }
 
 function nearBottom() {
-  const el = ui.transcript;
-  return el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+  const t = ui.transcript;
+  return t.scrollHeight - t.scrollTop - t.clientHeight < 160;
 }
 
-function addCard() {
+function newTurn(unit) {
+  const turn = el("section", "turn");
+  turn.dataset.speaker = unit.speaker;
+  turn.style.setProperty("--c", colorOf(unit.speaker));
+  const head = el("header");
+  const who = el("button", "who", labelOf(unit.speaker));
+  who.type = "button";
+  who.addEventListener("click", () => editSpeaker(turn.dataset.speaker));
+  head.append(who, el("time", null, clock(unit.start)));
+  turn.append(head);
+  ui.transcript.append(turn);
+  const turns = ui.transcript.querySelectorAll(".turn");
+  for (let i = 0; i < turns.length - MAX_TURNS_ON_PAGE; i++) turns[i].remove();
+  return turn;
+}
+
+function addUnit(unit, live) {
+  if (shownUnits.has(unit.id)) return;
+  shownUnits.add(unit.id);
   const stick = nearBottom();
-  const card = document.createElement("article");
-  card.className = "card pending";
-  card.append(line("trans", "⏳", "Tarjima qilinmoqda"));
-  ui.transcript.append(card);
+  if (!lastTurn || lastTurn.speaker !== unit.speaker || unit.start - lastTurn.end > SAME_TURN_GAP_S) {
+    lastTurn = { el: newTurn(unit), speaker: unit.speaker, end: unit.end };
+  }
+  lastTurn.end = unit.end;
+  const block = el("div", unit.translation ? "unit" : "unit untranslated");
+  block.dataset.translation = unit.translation || unit.source;
+  block.append(el("p", "tr", unit.translation || unit.source));
+  if (!unit.translation) block.append(el("p", "note", "⚠️ Tarjima qilinmadi, asl matn ko'rsatilmoqda"));
+  if (unit.note) block.append(el("p", "note", `ℹ️ ${unit.note}`));
+  if (unit.translation && unit.lang !== unit.target) block.append(el("p", "src", `${flagOf(unit.lang)} ${unit.source}`));
+  lastTurn.el.append(block);
   updatePlaceholder();
   if (stick) ui.transcript.scrollTop = ui.transcript.scrollHeight;
-  return card;
+  if (live && ui.tts.checked && config.tts && unit.translation) speak(unit.translation);
 }
 
-function fillCard(card, msg) {
-  const stick = nearBottom();
-  card.className = "card";
-  card.dataset.translation = msg.translation;
-  card.replaceChildren(
-    line("orig", flagOf(msg.source_lang), msg.text),
-    line("trans", flagOf(msg.target), msg.translation),
-  );
-  if (stick) ui.transcript.scrollTop = ui.transcript.scrollHeight;
+function relabel(id) {
+  ui.transcript.querySelectorAll(`.turn[data-speaker="${CSS.escape(id)}"] .who`).forEach((b) => (b.textContent = labelOf(id)));
+  if (ui.liveWho.dataset.speaker === id) ui.liveWho.textContent = labelOf(id);
 }
 
-function fail(id, message) {
-  const item = pending.get(id);
-  if (!item) return;
-  pending.delete(id);
-  item.card.className = "card error";
-  item.card.replaceChildren(line("trans", "⚠️", message));
+function showPending(pending, interpreting) {
+  const last = pending[pending.length - 1];
+  ui.live.hidden = !last && !interpreting;
+  if (last) {
+    ui.liveWho.dataset.speaker = last.speaker;
+    ui.liveWho.textContent = labelOf(last.speaker);
+    ui.liveWho.style.setProperty("--c", colorOf(last.speaker));
+    ui.liveText.textContent = `${flagOf(last.lang)} ${pending.filter((p) => p.speaker === last.speaker).map((p) => p.text).join(" ")}`;
+  } else {
+    ui.liveWho.textContent = "";
+    ui.liveText.textContent = "";
+  }
+  ui.liveBusy.hidden = !interpreting;
 }
 
 function updatePlaceholder() {
-  ui.placeholder.hidden = ui.transcript.querySelector(".card") !== null;
+  ui.placeholder.hidden = ui.transcript.querySelector(".turn") !== null;
+}
+
+function updateHint() {
+  if (!capture) return;
+  if (capture.paused) return;
+  ui.hint.textContent = listening ? `👂 Eshitilmoqda (${listening})` : "Tinglanmoqda…";
 }
 
 function showWarning(text) {
@@ -180,28 +348,205 @@ function showWarning(text) {
   ui.warning.hidden = !text;
 }
 
+// ---------- speakers ----------
+
+function editSpeaker(id) {
+  editingSpeaker = id;
+  ui.speakerName.value = labelOf(id);
+  ui.mergeInto.replaceChildren(
+    ...[...speakers.values()].filter((sp) => sp.id !== id).map((sp) => new Option(`→ ${sp.label}`, sp.id)),
+  );
+  ui.speakerMerge.hidden = ui.mergeInto.options.length === 0;
+  ui.speakerDialog.showModal();
+}
+
+ui.speakerRename.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const label = ui.speakerName.value.trim();
+  if (!label) return;
+  try {
+    await api(`/api/sessions/${session.id}/speakers/${editingSpeaker}`, { method: "PATCH", body: { label } });
+    speakers.set(editingSpeaker, { ...speakers.get(editingSpeaker), label });
+    relabel(editingSpeaker);
+    ui.speakerDialog.close();
+  } catch (err) {
+    showWarning(err.message);
+  }
+});
+
+ui.speakerMerge.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const into = ui.mergeInto.value;
+  if (!into || !confirm(`${labelOf(editingSpeaker)} → ${labelOf(into)}: birlashtirilsinmi?`)) return;
+  try {
+    await api(`/api/sessions/${session.id}/speakers/${editingSpeaker}/merge`, { method: "POST", body: { into } });
+    ui.speakerDialog.close();
+    await openSession(session.id);
+  } catch (err) {
+    showWarning(err.message);
+  }
+});
+
+// ---------- sessions dialog ----------
+
+function duration(first, last) {
+  if (!first) return "bo'sh";
+  const minutes = Math.round((last - first) / 60);
+  return minutes >= 60 ? `${Math.floor(minutes / 60)} soat ${minutes % 60} daq` : `${minutes} daq`;
+}
+
+async function showSessions() {
+  const list = await api("/api/sessions");
+  ui.sessionsList.replaceChildren(
+    ...list.map((s) => {
+      const li = el("li", s.id === session?.id ? "current" : "");
+      const open = el("button", "item");
+      open.type = "button";
+      open.append(
+        el("b", null, s.title),
+        el("span", "muted", `${new Date(s.created_at * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })} · ${s.units} gap · ${duration(s.first, s.last)}`),
+      );
+      open.addEventListener("click", async () => {
+        ui.sessionsDialog.close();
+        if (capture) stop();
+        await openSession(s.id);
+      });
+      const rename = el("button", "icon small", "✏️");
+      rename.type = "button";
+      rename.title = "Nomini o'zgartirish";
+      rename.addEventListener("click", async () => {
+        const title = prompt("Seminar nomi", s.title)?.trim();
+        if (!title) return;
+        await api(`/api/sessions/${s.id}`, { method: "PATCH", body: { title } });
+        if (s.id === session.id) ui.title.textContent = session.title = title;
+        showSessions();
+      });
+      const del = el("button", "icon small", "🗑");
+      del.type = "button";
+      del.title = "O'chirish";
+      del.addEventListener("click", async () => {
+        if (!confirm(`«${s.title}» va uning barcha tarjimalari, hisobotlari o'chirilsinmi?`)) return;
+        await api(`/api/sessions/${s.id}`, { method: "DELETE" });
+        if (s.id === session.id) {
+          store.set("session", "");
+          ui.sessionsDialog.close();
+          await chooseInitialSession();
+        } else {
+          showSessions();
+        }
+      });
+      li.append(open, rename, del);
+      return li;
+    }),
+  );
+  if (!ui.sessionsDialog.open) ui.sessionsDialog.showModal();
+}
+
+ui.sessionsBtn.addEventListener("click", () => showSessions().catch((err) => showWarning(err.message)));
+
+ui.newSession.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const created = await api("/api/sessions", { method: "POST", body: { title: ui.newTitle.value } });
+  ui.newTitle.value = "";
+  ui.sessionsDialog.close();
+  if (capture) stop();
+  await openSession(created.id);
+});
+
+// ---------- reports ----------
+
+function toLocalInput(ts) {
+  const d = new Date(ts * 1000);
+  d.setMinutes(d.getMinutes() - d.getTimezoneOffset());
+  return d.toISOString().slice(0, 16);
+}
+
+function fromLocalInput(value) {
+  return value ? new Date(value).getTime() / 1000 : null;
+}
+
+function sessionSpan() {
+  // the page shows only the newest units, so the whole seminar starts at its creation
+  return { first: session.created_at, last: Date.now() / 1000 };
+}
+
+function setRange(preset) {
+  const { first, last } = sessionSpan();
+  const start = preset === "all" ? first : Math.max(first, last - Number(preset) * 60);
+  ui.reportStart.value = toLocalInput(Math.floor(start / 60) * 60);
+  ui.reportEnd.value = toLocalInput(Math.ceil(last / 60) * 60);
+}
+
+function renderReports(reports) {
+  ui.reportsList.replaceChildren(
+    ...reports.map((r) => {
+      const li = el("li");
+      const a = el("a", "item", `📄 ${clock(r.start)}–${clock(r.end)} · ${new Date(r.created_at * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })}`);
+      a.href = `/api/reports/${r.id}`;
+      a.target = "_blank";
+      const md = el("a", "icon small", "MD");
+      md.href = `/api/reports/${r.id}.md`;
+      md.title = "Markdown yuklab olish";
+      md.setAttribute("download", "");
+      li.append(a, md);
+      return li;
+    }),
+  );
+  if (!reports.length) ui.reportsList.append(el("li", "muted", "Hali hisobot yo'q"));
+}
+
+ui.reportBtn.addEventListener("click", async () => {
+  try {
+    session = { ...session, ...(await api(`/api/sessions/${session.id}`)) };
+  } catch {}
+  setRange("all");
+  renderReports(session.reports || []);
+  ui.reportStatus.hidden = true;
+  ui.reportDialog.showModal();
+});
+
+ui.reportDialog.querySelectorAll("[data-preset]").forEach((b) => b.addEventListener("click", () => setRange(b.dataset.preset)));
+
+ui.reportMake.addEventListener("click", async () => {
+  const start = fromLocalInput(ui.reportStart.value);
+  const end = fromLocalInput(ui.reportEnd.value);
+  if (start == null || end == null || start >= end) {
+    ui.reportStatus.hidden = false;
+    ui.reportStatus.textContent = "Vaqt oralig'ini to'g'ri tanlang";
+    return;
+  }
+  ui.reportMake.disabled = true;
+  ui.reportStatus.hidden = false;
+  ui.reportStatus.textContent = "⏳ Hisobot tayyorlanmoqda… (uzun seminar uchun 1–2 daqiqa)";
+  try {
+    const { id } = await api(`/api/sessions/${session.id}/reports`, { method: "POST", body: { start, end } });
+    const data = await api(`/api/sessions/${session.id}`);
+    session.reports = data.reports;
+    renderReports(data.reports);
+    ui.reportStatus.textContent = "";
+    const link = el("a", null, "✅ Tayyor — hisobotni ochish");
+    link.href = `/api/reports/${id}`;
+    link.target = "_blank";
+    ui.reportStatus.append(link);
+  } catch (err) {
+    ui.reportStatus.textContent = `⚠️ ${err.message}`;
+  } finally {
+    ui.reportMake.disabled = false;
+  }
+});
+
 // ---------- audio capture ----------
 
 function onSegment(samples) {
-  const id = ++seq;
-  const item = {
-    card: addCard(),
-    frame: packSegment(id, encodeWav(samples, SAMPLE_RATE)),
-    sent: false,
-    at: Date.now(),
-  };
-  pending.set(id, item);
-  send(item);
-  if (!item.sent) {
-    // offline: keep only the newest few in memory
-    const unsent = [...pending].filter(([, it]) => !it.sent);
-    unsent.slice(0, -MAX_REPLAY).forEach(([oldId]) => fail(oldId, "Aloqa yo'q edi"));
+  const frame = packSegment(++seq, encodeWav(samples, SAMPLE_RATE), Date.now() / 1000);
+  if (!send(frame)) {
+    outbox.push({ frame, at: Date.now() });
+    outbox.splice(0, Math.max(0, outbox.length - MAX_REPLAY)); // keep memory bounded while offline
   }
 }
 
 function onSpeech(active) {
   ui.level.classList.toggle("speaking", active);
-  if (capture) ui.hint.textContent = active ? "🎙️ Nutq eshitilmoqda…" : "Tinglanmoqda…";
 }
 
 async function openStream() {
@@ -256,8 +601,8 @@ async function start() {
 
     ui.toggle.dataset.state = "running";
     ui.toggle.textContent = "■ To'xtatish";
-    ui.hint.textContent = "Tinglanmoqda…";
     ui.source.disabled = true;
+    updateHint();
     keepAwake();
     drawLevel();
   } catch (err) {
@@ -279,6 +624,10 @@ function stop() {
   c.ctx.close();
   wakeLock?.release().catch(() => {});
   wakeLock = null;
+  // interpret what was said up to now instead of waiting for more speech
+  setTimeout(() => {
+    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "flush" }));
+  }, 2500);
   ui.toggle.dataset.state = "idle";
   ui.toggle.textContent = "▶ Boshlash";
   ui.hint.textContent = "Tayyor";
@@ -364,7 +713,7 @@ async function playNext() {
       if (capture && !speaking && capture.paused) {
         capture.segmenter.requireSilence(300); // don't send the tail of a phrase we only half heard
         capture.paused = false;
-        ui.hint.textContent = "Tinglanmoqda…";
+        updateHint();
       }
     }, 300);
   }
@@ -382,9 +731,17 @@ async function waitForPause(maxMs) {
 
 ui.toggle.addEventListener("click", () => (capture ? stop() : start()));
 
-ui.partner.addEventListener("change", () => {
-  store.set("partner", ui.partner.value);
-  sendConfig();
+ui.partner.addEventListener("change", async () => {
+  try {
+    await api(`/api/sessions/${session.id}`, { method: "PATCH", body: { partner: ui.partner.value } });
+  } catch (err) {
+    showWarning(err.message);
+  }
+});
+
+ui.showSrc.addEventListener("change", () => {
+  document.body.classList.toggle("show-src", ui.showSrc.checked);
+  store.set("showSrc", ui.showSrc.checked ? "1" : "0");
 });
 
 ui.tts.addEventListener("change", () => {
@@ -396,9 +753,14 @@ ui.tts.addEventListener("change", () => {
 });
 
 ui.copy.addEventListener("click", async () => {
-  const text = [...ui.transcript.querySelectorAll(".card[data-translation]")]
-    .map((c) => c.dataset.translation)
-    .join("\n");
+  const text = [...ui.transcript.querySelectorAll(".turn")]
+    .map((turn) => {
+      const who = turn.querySelector(".who").textContent;
+      const time = turn.querySelector("time").textContent;
+      const lines = [...turn.querySelectorAll(".unit")].map((u) => u.dataset.translation);
+      return `[${time}] ${who}:\n${lines.join("\n")}`;
+    })
+    .join("\n\n");
   if (!text) return;
   try {
     await navigator.clipboard.writeText(text);
@@ -408,28 +770,17 @@ ui.copy.addEventListener("click", async () => {
   }
 });
 
-ui.clear.addEventListener("click", () => {
-  ui.transcript.querySelectorAll(".card").forEach((c) => c.remove());
-  pending.clear();
-  updatePlaceholder();
-  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "reset" }));
-});
-
 async function init() {
-  const res = await fetch("/api/config");
-  if (res.status === 401) {
-    location.reload();
-    return;
-  }
-  config = await res.json();
+  config = await api("/api/config");
+  ui.partner.add(new Option("O'zbekcha qolsin", "uz"));
   for (const code of config.partners) {
     const { flag, name } = config.langs[code];
-    ui.partner.add(new Option(`${flag} ${name}ga`, code));
+    ui.partner.add(new Option(`${flag} ${name}ga tarjima`, code));
   }
-  const saved = store.get("partner");
-  ui.partner.value = config.partners.includes(saved) ? saved : config.default_partner;
   ui.ttsLabel.hidden = !config.tts;
   ui.tts.checked = config.tts && store.get("tts") === "1";
+  ui.showSrc.checked = store.get("showSrc") === "1";
+  document.body.classList.toggle("show-src", ui.showSrc.checked);
   ui.logout.hidden = !config.auth;
   if (!navigator.mediaDevices?.getDisplayMedia) ui.source.querySelector('[value="tab"]').disabled = true;
   if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
@@ -439,7 +790,7 @@ async function init() {
         "(serverda .env ga SSL_SELF_SIGNED=1 yozing yoki domen + sertifikat ulang).",
     );
   }
-  connect();
+  await chooseInitialSession();
 }
 
-init();
+init().catch((err) => showWarning(err.message));

@@ -10,7 +10,11 @@
 </head>
 <body>
   <header class="bar">
-    <h1>🎙️ Jonli tarjimon</h1>
+    <button id="sessions-btn" class="session-title" title="Seminarlar">
+      <span class="logo">🎙️</span>
+      <span id="session-title">Seminar</span>
+      <span class="caret">▾</span>
+    </button>
     <span id="status" class="status" data-state="connecting">Ulanmoqda…</span>
     <form id="logout" method="post" action="/logout" hidden><button type="submit" class="link">Chiqish</button></form>
   </header>
@@ -22,34 +26,88 @@
         <option value="tab">🖥️ Tab / ekran ovozi</option>
       </select>
     </label>
-    <label>O'zbekcha gap tarjimasi
+    <label>O'zbekcha nutq
       <select id="partner"></select>
     </label>
-    <label class="check" id="tts-label">
-      <input type="checkbox" id="tts"> 🔊 Tarjimani ovozli o'qish
-    </label>
+    <label class="check"><input type="checkbox" id="show-src"> Asl matn</label>
+    <label class="check" id="tts-label"><input type="checkbox" id="tts"> 🔊 Ovozli o'qish</label>
   </section>
+
+  <details id="context" class="context" hidden>
+    <summary>📝 Kontekst: seminar mazmuni va atamalar</summary>
+    <p id="context-summary"></p>
+    <ul id="context-terms" class="terms"></ul>
+  </details>
 
   <div id="warning" class="warning" role="alert" hidden></div>
 
   <main id="transcript" class="transcript" aria-live="polite">
     <div id="placeholder" class="placeholder">
-      <p class="big">▶ <b>Boshlash</b> tugmasini bosing va gapiring.</p>
-      <p>Xitoycha, ruscha, inglizcha, turkcha va boshqa tillardagi nutq real vaqtda <b>o'zbekchaga</b> tarjima qilinadi.
-        O'zbekcha gaplar yuqorida tanlangan tilga o'giriladi.</p>
-      <p class="muted">Har bir gap pauza qilinganda yuboriladi, tarjima 1–3 soniyada chiqadi.</p>
+      <p class="big">▶ <b>Boshlash</b> tugmasini bosing.</p>
+      <p>Seminardagi nutq (xitoycha, ruscha, inglizcha, turkcha va boshqa tillar) tarjimonlar kabi tarjima qilinadi.
+        Har bir fikr tugagach, kontekstni hisobga olgan holda tushunarli <b>o'zbekcha</b> matn chiqadi.
+        Kim gapirayotgani ham aniqlanadi.</p>
+      <p class="muted">Spiker nomini bosib o'zgartirishingiz mumkin. 📄 tugmasi istalgan vaqt oralig'i uchun hisobot tayyorlaydi.</p>
     </div>
   </main>
 
+  <div id="live" class="live" hidden>
+    <span id="live-who" class="who-chip"></span>
+    <span id="live-text" class="live-text"></span>
+    <span id="live-busy" class="live-busy" hidden>⏳ tarjima qilinmoqda</span>
+  </div>
+
   <footer class="bar controls">
-    <button id="copy" class="icon" title="Tarjimalarni nusxalash" aria-label="Tarjimalarni nusxalash">📋</button>
+    <button id="copy" class="icon" title="Tarjimani nusxalash" aria-label="Tarjimani nusxalash">📋</button>
     <div class="mic-wrap">
       <button id="toggle" class="mic" data-state="idle">▶ Boshlash</button>
       <div class="meter" aria-hidden="true"><div id="level"></div></div>
       <div id="hint" class="hint">Tayyor</div>
     </div>
-    <button id="clear" class="icon" title="Tozalash" aria-label="Tozalash">🗑</button>
+    <button id="report-btn" class="icon" title="Hisobot" aria-label="Hisobot">📄</button>
   </footer>
+
+  <dialog id="sessions-dialog" class="dialog">
+    <form method="dialog" class="dialog-head"><h2>Seminarlar</h2><button class="icon small" aria-label="Yopish">✕</button></form>
+    <form id="new-session" class="row">
+      <input id="new-title" placeholder="Yangi seminar nomi" maxlength="200">
+      <button type="submit" class="primary">＋ Yangi</button>
+    </form>
+    <ul id="sessions-list" class="list"></ul>
+  </dialog>
+
+  <dialog id="report-dialog" class="dialog">
+    <form method="dialog" class="dialog-head"><h2>Hisobot</h2><button class="icon small" aria-label="Yopish">✕</button></form>
+    <p class="muted">Qaysi vaqt oralig'i uchun? Hisobotda nima bo'lgani, kim gapirgani va nima degani, savol-javoblar,
+      qarorlar, atamalar va to'liq transkript bo'ladi.</p>
+    <div class="presets">
+      <button type="button" data-preset="all">Butun seminar</button>
+      <button type="button" data-preset="30">Oxirgi 30 daqiqa</button>
+      <button type="button" data-preset="60">Oxirgi 1 soat</button>
+      <button type="button" data-preset="120">Oxirgi 2 soat</button>
+    </div>
+    <div class="row">
+      <label>Boshlanishi <input type="datetime-local" id="report-start" step="60"></label>
+      <label>Tugashi <input type="datetime-local" id="report-end" step="60"></label>
+    </div>
+    <button id="report-make" class="primary wide">Hisobot tayyorlash</button>
+    <p id="report-status" class="muted" hidden></p>
+    <h3>Tayyor hisobotlar</h3>
+    <ul id="reports-list" class="list"></ul>
+  </dialog>
+
+  <dialog id="speaker-dialog" class="dialog">
+    <form method="dialog" class="dialog-head"><h2>Spiker</h2><button class="icon small" aria-label="Yopish">✕</button></form>
+    <form id="speaker-rename" class="row">
+      <input id="speaker-name" maxlength="80" placeholder="Ismi yoki lavozimi" required>
+      <button type="submit" class="primary">Saqlash</button>
+    </form>
+    <p class="muted">Bir odam ikki xil spiker bo'lib qolgan bo'lsa, birlashtiring:</p>
+    <form id="speaker-merge" class="row">
+      <select id="merge-into"></select>
+      <button type="submit">Birlashtirish</button>
+    </form>
+  </dialog>
 
   <script type="module" src="/static/app.js"></script>
 </body>

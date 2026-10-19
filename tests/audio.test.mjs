@@ -195,7 +195,19 @@ test("encodeWav writes a valid 16-bit mono header and clamps samples", () => {
   assert.deepEqual(pcm, [0, 32767, -32768, 32767, -32768, 16383]);
 });
 
-test("packSegment prefixes a big-endian id", () => {
-  const frame = packSegment(258, new Uint8Array([82, 73, 70, 70]).buffer);
-  assert.deepEqual([...frame], [0, 0, 1, 2, 82, 73, 70, 70]);
+test("packSegment prefixes a big-endian id and the capture time", () => {
+  const frame = packSegment(258, new Uint8Array([82, 73, 70, 70]).buffer, 1760000000.5);
+  const view = new DataView(frame.buffer);
+  assert.equal(view.getUint32(0, false), 258);
+  assert.equal(view.getFloat64(4, false), 1760000000.5);
+  assert.deepEqual([...frame.slice(12)], [82, 73, 70, 70]);
+});
+
+test("a short word followed by a sub-second pause stays with the next phrase", () => {
+  // "Thank you." ... 0.9 s ... "Now a break." must not be sent as two pieces
+  const { segments } = run(join(noise(500, 0.002), speech(700), noise(900, 0.002), speech(2000), noise(1500, 0.002)));
+  assert.equal(segments.length, 1);
+  // but a real pause still separates them
+  const apart = run(join(noise(500, 0.002), speech(700), noise(1400, 0.002), speech(2000), noise(1500, 0.002)));
+  assert.equal(apart.segments.length, 2);
 });
