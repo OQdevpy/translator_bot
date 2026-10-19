@@ -1,0 +1,7 @@
+services:
+  stt_bot:
+    build: .
+    container_name: stt_bot
+    restart: unless-stopped
+    env_file:
+      - .env
