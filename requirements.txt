@@ -3,3 +3,4 @@ google-genai>=1.20
 pydantic>=2.0
 requests>=2.31
 python-dotenv>=1.0
+tzdata>=2024.1

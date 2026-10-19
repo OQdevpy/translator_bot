@@ -1,7 +1,11 @@
 import html
 import logging
 import os
+import threading
+import time
 from collections import deque
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import requests
 import telebot
@@ -9,7 +13,15 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel
-from telebot.types import BotCommand, CopyTextButton, InlineKeyboardButton, InlineKeyboardMarkup
+from telebot.types import (
+    BotCommand,
+    BotCommandScopeChat,
+    CopyTextButton,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+
+from usage import Totals, UsageLog
 
 load_dotenv()
 
@@ -19,6 +31,17 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
 ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v3")
 ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # Sarah (premade)
+
+# Telegram user IDs allowed to see /usage and receive the daily report
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split()}
+TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
+REPORT_TIME = os.getenv("REPORT_TIME", "21:00")  # daily report, local time
+DATA_DIR = os.getenv("DATA_DIR", "data")
+# USD per 1M tokens; output includes thinking tokens
+GEMINI_PRICE_IN = float(os.getenv("GEMINI_PRICE_IN", "1.50"))
+GEMINI_PRICE_AUDIO_IN = float(os.getenv("GEMINI_PRICE_AUDIO_IN", str(GEMINI_PRICE_IN)))
+GEMINI_PRICE_OUT = float(os.getenv("GEMINI_PRICE_OUT", "7.50"))
+GEMINI_MONTHLY_BUDGET = float(os.getenv("GEMINI_MONTHLY_BUDGET_USD") or 0)  # 0: not shown
 
 # code -> (flag, Uzbek name for buttons, name for the prompt)
 LANGS = {
@@ -58,6 +81,8 @@ log = logging.getLogger("stt_bot")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+usage_log = UsageLog(os.path.join(DATA_DIR, "usage.db"))
+
 
 class Interpretation(BaseModel):
     source_lang: str
@@ -90,6 +115,7 @@ def interpret(contents, partner: str, history=()) -> Interpretation:
             response_schema=Interpretation,
         ),
     )
+    record_gemini_usage(response.usage_metadata)
     result = Interpretation.model_validate_json(response.text or "")
     result.source_lang = result.source_lang.strip().lower()
     result.text = result.text.strip()
@@ -107,7 +133,118 @@ def synthesize(text: str) -> bytes:
     )
     if resp.status_code != 200:
         raise RuntimeError(f"ElevenLabs {resp.status_code}: {resp.text[:300]}")
+    cost = resp.headers.get("character-cost", "")
+    usage_log.add("elevenlabs", credits=int(cost) if cost.isdigit() else len(text))
     return resp.content
+
+
+def record_gemini_usage(meta: types.GenerateContentResponseUsageMetadata | None):
+    if meta is None:
+        return
+    prompt = meta.prompt_token_count or 0
+    audio = sum(
+        d.token_count or 0
+        for d in meta.prompt_tokens_details or []
+        if d.modality == types.MediaModality.AUDIO
+    )
+    output = (meta.candidates_token_count or 0) + (meta.thoughts_token_count or 0)
+    cost = ((prompt - audio) * GEMINI_PRICE_IN + audio * GEMINI_PRICE_AUDIO_IN + output * GEMINI_PRICE_OUT) / 1e6
+    usage_log.add("gemini", input_tokens=prompt, audio_tokens=audio, output_tokens=output, cost=cost)
+
+
+def elevenlabs_subscription() -> dict | None:
+    """Needs the "User: Read" permission on the API key; None when unavailable."""
+    try:
+        resp = requests.get(
+            "https://api.elevenlabs.io/v1/user/subscription",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        log.warning("ElevenLabs subscription unavailable: %s", e)
+        return None
+
+
+def num(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def gemini_line(t: Totals) -> str:
+    return (
+        f"{t.requests} so'rov · {num(t.input_tokens + t.output_tokens)} token "
+        f"(kirish {num(t.input_tokens)}, shundan audio {num(t.audio_tokens)}; "
+        f"chiqish {num(t.output_tokens)}) · <b>≈ ${t.cost:.4f}</b>"
+    )
+
+
+def usage_report() -> str:
+    now = datetime.now(TIMEZONE)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_start = day_start.replace(day=1)
+    g_day = usage_log.totals("gemini", day_start.timestamp())
+    g_month = usage_log.totals("gemini", month_start.timestamp())
+    e_day = usage_log.totals("elevenlabs", day_start.timestamp())
+    e_month = usage_log.totals("elevenlabs", month_start.timestamp())
+
+    lines = [
+        f"📊 <b>Usage</b> · {now:%d.%m.%Y %H:%M}",
+        "",
+        f"🤖 <b>Gemini</b> ({html.escape(GEMINI_MODEL)})",
+        f"Bugun: {gemini_line(g_day)}",
+        f"Shu oy: {gemini_line(g_month)}",
+    ]
+    if GEMINI_MONTHLY_BUDGET:
+        left = GEMINI_MONTHLY_BUDGET - g_month.cost
+        lines.append(f"Oylik limitdan qoldi: <b>≈ ${left:.2f}</b> / ${GEMINI_MONTHLY_BUDGET:.2f}")
+    lines += [
+        "",
+        f"🔊 <b>ElevenLabs</b> ({html.escape(ELEVENLABS_MODEL)})",
+        f"Bugun: {e_day.requests} so'rov · {num(e_day.credits)} kredit",
+        f"Shu oy: {e_month.requests} so'rov · {num(e_month.credits)} kredit",
+    ]
+    sub = elevenlabs_subscription()
+    if sub:
+        used, limit = sub["character_count"], sub["character_limit"]
+        reset = datetime.fromtimestamp(sub["next_character_count_reset_unix"], TIMEZONE)
+        lines.append(
+            f"Obuna ({html.escape(str(sub.get('tier')))}): {num(used)} / {num(limit)} kredit, "
+            f"qoldi <b>{num(limit - used)}</b> (yangilanadi {reset:%d.%m})"
+        )
+    else:
+        lines.append("Qolgan kredit: API kalitga «User → Read» ruxsatini bering")
+    lines += [
+        "",
+        "<i>Gemini summasi bot hisoblagan taxminiy narx: Google balansni API orqali bermaydi.</i>",
+    ]
+    return "\n".join(lines)
+
+
+def usage_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("🔄 Yangilash", callback_data="usage"))
+    return kb
+
+
+def daily_report_loop():
+    hour, minute = map(int, REPORT_TIME.split(":"))
+    while True:
+        now = datetime.now(TIMEZONE)
+        next_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if next_run <= now:
+            next_run += timedelta(days=1)
+        time.sleep((next_run - now).total_seconds())
+        try:
+            report = usage_report()
+        except Exception:
+            log.exception("Daily report failed")
+            continue
+        for admin_id in ADMIN_IDS:
+            try:
+                bot.send_message(admin_id, "🌙 <b>Kunlik hisobot</b>\n\n" + report, reply_markup=usage_keyboard())
+            except Exception:
+                log.exception("Daily report to %s failed", admin_id)
 
 
 def flag(code: str) -> str:
@@ -226,6 +363,35 @@ def handle_lang(call):
     )
 
 
+@bot.message_handler(commands=["usage"])
+def show_usage(message):
+    if message.from_user.id not in ADMIN_IDS:
+        log.info("/usage denied for user %s", message.from_user.id)
+        bot.reply_to(
+            message,
+            "⛔ Bu buyruq faqat admin uchun.\n"
+            f"Sizning ID: <code>{message.from_user.id}</code> (uni .env dagi ADMIN_IDS ga yozing).",
+        )
+        return
+    bot.send_chat_action(message.chat.id, "typing")
+    bot.reply_to(message, usage_report(), reply_markup=usage_keyboard())
+
+
+@bot.callback_query_handler(func=lambda call: call.data == "usage")
+def refresh_usage(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "Faqat admin uchun")
+        return
+    bot.answer_callback_query(call.id, "Yangilandi")
+    try:
+        bot.edit_message_text(
+            usage_report(), call.message.chat.id, call.message.message_id, reply_markup=usage_keyboard()
+        )
+    except telebot.apihelper.ApiTelegramException as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
 @bot.message_handler(content_types=["voice", "audio"])
 def handle_audio(message):
     media = message.voice or message.audio
@@ -246,8 +412,17 @@ def handle_text(message):
 
 
 if __name__ == "__main__":
-    bot.set_my_commands(
-        [BotCommand("start", "Boshlash"), BotCommand("til", "Suhbatdosh tilini tanlash")]
-    )
+    commands = [BotCommand("start", "Boshlash"), BotCommand("til", "Suhbatdosh tilini tanlash")]
+    bot.set_my_commands(commands)
+    for admin_id in ADMIN_IDS:
+        try:  # fails until the admin has opened a chat with the bot
+            bot.set_my_commands(
+                [*commands, BotCommand("usage", "Gemini va ElevenLabs sarfi")],
+                scope=BotCommandScopeChat(admin_id),
+            )
+        except Exception as e:
+            log.warning("Admin commands for %s not set: %s", admin_id, e)
+    if ADMIN_IDS:
+        threading.Thread(target=daily_report_loop, daemon=True).start()
     log.info("Bot ishga tushdi (gemini: %s, elevenlabs: %s)", GEMINI_MODEL, ELEVENLABS_MODEL)
     bot.infinity_polling(timeout=30, long_polling_timeout=25)
