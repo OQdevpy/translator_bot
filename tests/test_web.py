@@ -764,14 +764,16 @@ def test_answers_about_a_phrase_go_only_to_the_device_that_sent_it(client, ai, s
         sender.send_bytes(frame(2))  # silence
         assert recv_until(sender, "empty")[0] == {"type": "empty", "id": 2}
         other.send_text(json.dumps({"type": "ping"}))
-        assert recv(other) == {"type": "pong"}  # the first thing it gets: no "empty" meant for the sender
+        _, seen_other = recv_until(other, "pong")
+        assert not {"heard", "empty", "pong"} & set(kinds(seen_other[:-1]))  # the pong only for who asked
         sender.send_text(json.dumps({"type": "ping"}))
-        assert recv(sender) == {"type": "pong"}
+        _, seen_sender = recv_until(sender, "pong")
+        assert "pong" not in kinds(seen_sender[:-1])
 
 
 def test_resent_phrase_is_acknowledged_without_processing_it_again(client, ai, sid, lives, monkeypatch):
     monkeypatch.setattr(web, "UNLOAD_GRACE_SECONDS", 30.0)
-    ai.heards = [heard("Bir"), heard("Ikki"), heard("Uch")]
+    ai.heards = [heard("Bir"), heard("Ikki", speaker="S1"), heard("Uch", speaker="S1")]
     url = f"/ws?session={sid}&client=page-1_A"
     with client.websocket_connect(url) as ws:
         ws.send_bytes(frame(1))
@@ -805,6 +807,7 @@ def test_phrase_resent_while_still_queued_is_a_dup(client, ai, sid):
 
 @pytest.mark.parametrize("query", ["", "&client=", "&client=bad%20id", "&client=" + "x" * 41, "&client=a.b"])
 def test_without_a_valid_client_id_phrases_are_not_deduplicated(client, ai, sid, query):
+    ai.heards = [heard("Bir"), heard("Ikki")]
     with client.websocket_connect(f"/ws?session={sid}{query}") as ws:
         for _ in range(2):
             ws.send_bytes(frame(1))

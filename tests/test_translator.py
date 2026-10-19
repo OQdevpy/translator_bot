@@ -335,3 +335,19 @@ def test_report_call_uses_the_report_model_and_medium_thinking(usage_log):
     paths.clear()
     SeminarAI(interpreter).report("t", "s", "p")  # no report model configured: the main model
     assert paths == ["models/flash:generateContent"]
+
+
+def test_listen_call_writes_the_transcript_before_deciding_who_speaks(usage_log):
+    """The schema's property order is the order Gemini writes in: identity is decided with the words in view."""
+    from seminar import LISTEN_MAX_TOKENS, LISTEN_TIMEOUT, SeminarAI
+
+    answer = {"text": "Salom", "source_lang": "uz", "complete": True, "voice": "", "speaker_name": "", "speaker": "new"}
+    captured, options = [], []
+    interpreter = Interpreter(fake_gemini(captured, answer, options=options), "flash", usage_log)
+    SeminarAI(interpreter).listen(b"RIFF....WAVE", [], {}, [], {})
+    config = captured[0]["generationConfig"]
+    schema = config["responseSchema"]
+    ordering = schema.get("propertyOrdering") or schema.get("property_ordering")
+    assert ordering == ["text", "source_lang", "complete", "voice", "speaker_name", "speaker"]
+    # a live phrase is retried rather than awaited, and a looping answer is cut off
+    assert options[0].timeout == LISTEN_TIMEOUT * 1000 and config["maxOutputTokens"] == LISTEN_MAX_TOKENS

@@ -260,6 +260,8 @@ def test_seminar_ai_listen_builds_prompt_and_normalizes():
     assert contents[1].inline_data.data == b"RIFF-ref"
     assert contents[2] == "NEW SEGMENT:" and contents[3].inline_data.data == b"RIFF-new"
     assert "   - S1: 0.70" in call["system"] and "0.62 or more, different people 0.30 or less" in call["system"]
+    # the moderator handing the floor to "Professor Karimov" is not Professor Karimov
+    assert "Never the name of the person they address or hand the floor to" in call["system"]
     # listening needs only the spellings; the summary is for interpreting (and costs tokens on every phrase)
     assert "KPI = asosiy ko'rsatkich" in call["system"] and "Xulosa" not in call["system"]
     assert "[S1 Aziz] earlier" in call["system"]
@@ -1691,6 +1693,53 @@ def test_echo_window_expires(store, sid, monkeypatch):
         for i in range(2):
             await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
             await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert len(store.units(sid)) == 2
+
+
+def test_the_same_phrase_from_a_second_device_is_dropped(store, sid):
+    """Two phones recording one seminar: every phrase arrives twice and must be kept once."""
+    ai = FakeAI(
+        [heard("Bugun logistika haqida gaplashamiz.", speaker="new"),
+         heard("Bugun logistika haqida gaplashamiz", speaker="S1"),  # the other phone, slightly different
+         heard("Bugun logistika haqida gaplashamiz.", speaker="S1")],  # the first phone again: a real repeat
+        # translations unlike the source, so the read-out echo filter stays out of this test
+        interpret=[Rendered(translation="Today we talk about logistics.", note="")] * 2,
+    )
+
+    async def main():
+        sess, phone = start(store, sid, ai, None)
+        laptop = FakeWS()
+        sess.join(laptop)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=phone)
+        await drain(sess)
+        await sess.add_audio(1, make_wav(2.0), T0 + 0.5, origin=laptop)
+        await drain(sess)
+        await sess.add_audio(2, make_wav(2.0), T0 + 5, origin=phone)
+        await drain(sess)
+        sess.close()
+        return phone, laptop
+
+    phone, laptop = asyncio.run(main())
+    assert [m["id"] for m in laptop.of("empty")] == [1]
+    assert len(store.units(sid)) == 2
+
+
+def test_duplicates_are_only_looked_for_within_a_short_window(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "DUPLICATE_SECONDS", 0.0)
+    ai = FakeAI([heard("Rahmat.", speaker="new"), heard("Rahmat.", speaker="S1")],
+                interpret=[Rendered(translation="Thank you.", note="")] * 2)
+
+    async def main():
+        sess, phone = start(store, sid, ai, None)
+        laptop = FakeWS()
+        sess.join(laptop)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=phone)
+        await drain(sess)
+        await sess.add_audio(1, make_wav(2.0), T0 + 60, origin=laptop)
+        await drain(sess)
         sess.close()
 
     asyncio.run(main())

@@ -179,13 +179,14 @@ async function resync(rebuild = false) {
   if (!seen.pending) showPending(data.pending, data.interpreting ?? 0);
 }
 
-function chooseInitialSession() {
+function chooseInitialSession(gone = null) {
   // the 4404 of a deleted seminar and its caller may both ask: only one pick may run
-  choosing ??= pickSession().finally(() => (choosing = null));
+  choosing ??= pickSession(gone).finally(() => (choosing = null));
   return choosing;
 }
 
-async function pickSession() {
+/** gone: a seminar just deleted elsewhere; the server closes our socket before it removes the row. */
+async function pickSession(gone) {
   const saved = Number(store.get("session"));
   if (saved) {
     try {
@@ -193,7 +194,7 @@ async function pickSession() {
       return;
     } catch {}
   }
-  const list = await api("/api/sessions");
+  const list = (await api("/api/sessions")).filter((s) => s.id !== gone);
   const today = new Date().toDateString();
   const recent = list.find((s) => new Date(s.created_at * 1000).toDateString() === today);
   await openSession(recent ? recent.id : (await api("/api/sessions", { method: "POST", body: {} })).id);
@@ -278,7 +279,7 @@ function onClosed(socket, sessionId, code) {
   if (code === 4404) {
     if (sessionId === deleting) return; // this page deleted it: the delete handler picks the next seminar
     store.set("session", "");
-    chooseInitialSession().catch((err) => showWarning(err.message));
+    chooseInitialSession(sessionId).catch((err) => showWarning(err.message));
     return;
   }
   setTimeout(() => {
@@ -919,7 +920,7 @@ window.addEventListener("beforeunload", (event) => {
   // a pull-to-refresh or a stray swipe would silently end the recording
   if (!capture) return;
   event.preventDefault();
-  event.returnValue = "";
+  event.returnValue = true; // older Chrome asks only with this
 });
 
 // ---------- voice output ----------

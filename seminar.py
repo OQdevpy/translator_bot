@@ -53,6 +53,8 @@ MAX_QUEUED_SEGMENTS = 20  # per session; protects the API budget from a runaway 
 DEDUPE_SECONDS = 15 * 60  # a phrase resent after a reconnect is recognised for this long
 ECHO_SECONDS = 90.0  # a phrase that matches a translation this recent is its read-out picked up by a microphone
 ECHO_SIMILARITY = 0.8
+DUPLICATE_SECONDS = 30.0  # two devices recording the same room hear the same phrase within this time
+DUPLICATE_SIMILARITY = 0.85
 # per-call limits: a stuck call must not hold up the live queue, a long report must be allowed to finish
 LISTEN_TIMEOUT, LISTEN_MAX_TOKENS = 20.0, 2048
 INTERPRET_TIMEOUT, INTERPRET_MAX_TOKENS = 60.0, 2048
@@ -582,6 +584,7 @@ class LiveSession:
             maxlen=RECENT_UNITS,
         )
         self.read_out: deque[tuple[float, list[str]]] = deque()  # (time, normalized translation and its sentences)
+        self.recent_heard: deque[tuple[float, object, str]] = deque()  # (time, sending socket, normalized phrase)
         self.units_since_notes = store.count_units(session_id, row["notes_unit"])
         self.working = 0  # phrases or thoughts being processed right now
         self.listening = 0  # phrases being transcribed right now
@@ -815,7 +818,7 @@ class LiveSession:
             self.ai.listen, wav, references, sims, self.recent_transcript(), self.notes,
             identified=(voice_id or "new") if decided else None,
         )
-        if not heard.text or self._is_echo(heard.text):
+        if not heard.text or self._is_echo(heard.text) or self._heard_by_another_device(heard.text, origin):
             await self._reply(origin, {"type": "empty", "id": seg_id})
             return
         # resolved again: the speakers may have been merged while the speaker message was being sent
@@ -844,6 +847,22 @@ class LiveSession:
         else:
             self._arm_idle_flush()
             await self.broadcast_pending()
+
+    def _heard_by_another_device(self, text: str, origin) -> bool:
+        """Two phones recording the same seminar send every phrase twice: keep the first one only."""
+        now = time.monotonic()
+        while self.recent_heard and self.recent_heard[0][0] < now - DUPLICATE_SECONDS:
+            self.recent_heard.popleft()
+        if origin is None:
+            return False
+        phrase = normalized(text)
+        duplicate = bool(phrase) and any(
+            device is not origin and SequenceMatcher(None, phrase, other).ratio() >= DUPLICATE_SIMILARITY
+            for _, device, other in self.recent_heard
+        )
+        if not duplicate:
+            self.recent_heard.append((now, origin, phrase))
+        return duplicate
 
     def _is_echo(self, text: str) -> bool:
         """A translation read out aloud by a device in the room and picked up by a microphone again:

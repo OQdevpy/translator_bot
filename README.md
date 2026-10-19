@@ -35,8 +35,16 @@ Sayt tarjimon ishlaydigan tamoyil asosida qurilgan: avval eshitadi, fikr tugagan
 
    Hisobotni chop etish (PDF) yoki Markdown ko'rinishida yuklab olish mumkin.
 
-Hammasi `data/seminars.db` faylida saqlanadi. Sahifa yangilansa yoki aloqa uzilsa ham hech narsa yo'qolmaydi,
-shuning uchun sayt kun bo'yi ishlashi mumkin. Seminarlar ro'yxati sarlavhadagi ▾ tugmasida.
+Hammasi `data/seminars.db` faylida saqlanadi, shuning uchun sayt kun bo'yi ishlashi mumkin. Seminarlar ro'yxati
+sarlavhadagi ▾ tugmasida.
+
+- **Aloqa uzilsa yoki server qayta ishga tushsa:** yozilgan iboralar qayta yuboriladi, sahifa esa o'tkazib yuborilgan
+  tarjimalarni serverdan qayta oladi.
+- **Bir seminarga bir nechta qurilma ulansa:** masalan, telefon yozadi, noutbukda o'qiladi. Ikki qurilma bir xil gapni
+  yozsa, u bir marta saqlanadi.
+- **Kun bo'yi hisobot:** 1–2 daqiqa olishi mumkin. U fonda tayyorlanadi va sahifa tayyor bo'lishini o'zi kutadi.
+- **Telefonda:** yozish paytida ekranni o'chirmang va sahifani boshqa ilova ostida qoldirmang. Brauzer fondagi
+  mikrofonni to'xtatadi, bunda sahifa ogohlantirish ko'rsatadi.
 
 ## Ishga tushirish (Docker)
 
