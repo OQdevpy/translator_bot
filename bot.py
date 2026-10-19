@@ -1,6 +1,7 @@
 import html
 import logging
 import os
+from collections import deque
 
 import requests
 import telebot
@@ -35,13 +36,19 @@ INTERPRET_PROMPT = (
     "Detect the language of the input (speech or text). "
     "If it is Uzbek, translate it into {partner}; "
     "if it is any other language, translate it into Uzbek (Latin script). "
-    "Translate the meaning naturally, as spoken language, not word by word. Keep names as they are.\n"
+    "Translate the meaning naturally, as spoken language, not word by word. "
+    "Keep names, numbers and currencies as they are (e.g. 块/元 is yuan, not so'm).\n"
     "Return JSON fields:\n"
     "- source_lang: ISO 639-1 code of the input language (uz, zh, tr, en, ru, ...)\n"
     "- text: the input in its original language; for audio the exact transcription, "
     "empty if there is no speech\n"
     "- translation: only the translation, no pinyin, quotes, notes or explanations"
 )
+HISTORY_PROMPT = (
+    "\n\nConversation so far, oldest first. Use it only as context to resolve meaning, "
+    "names, pronouns and tone; translate only the new input:\n{history}"
+)
+HISTORY_SIZE = 10  # last exchanges per chat given to Gemini as context
 TEXT_LIMIT = 3500  # below Telegram's 4096 after HTML markup
 COPY_LIMIT = 256  # Telegram's limit for copy_text buttons
 
@@ -52,22 +59,30 @@ log = logging.getLogger("stt_bot")
 client = genai.Client(api_key=GEMINI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-# chat_id -> partner language code; kept in memory, resets to DEFAULT_PARTNER on restart
-partner_langs: dict[int, str] = {}
-
-
 class Interpretation(BaseModel):
     source_lang: str
     text: str
     translation: str
 
 
-def interpret(contents, partner: str) -> Interpretation:
+# Both kept in memory, so they reset on restart.
+# chat_id -> partner language code
+partner_langs: dict[int, str] = {}
+# chat_id -> recent exchanges, used as translation context
+histories: dict[int, deque[Interpretation]] = {}
+
+
+def interpret(contents, partner: str, history=()) -> Interpretation:
+    system = INTERPRET_PROMPT.format(partner=LANGS[partner][2])
+    if history:
+        system += HISTORY_PROMPT.format(
+            history="\n".join(f"[{h.source_lang}] {h.text} => {h.translation}" for h in history)
+        )
     response = client.models.generate_content(
         model=GEMINI_MODEL,
         contents=contents,
         config=types.GenerateContentConfig(
-            system_instruction=INTERPRET_PROMPT.format(partner=LANGS[partner][2]),
+            system_instruction=system,
             temperature=0.2,
             thinking_config=types.ThinkingConfig(thinking_level="low"),
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
@@ -154,9 +169,10 @@ def reply_with_voice(message, text: str):
 
 def translate_and_reply(message, contents):
     partner = partner_langs.get(message.chat.id, DEFAULT_PARTNER)
+    history = histories.setdefault(message.chat.id, deque(maxlen=HISTORY_SIZE))
     bot.send_chat_action(message.chat.id, "typing")
     try:
-        result = interpret(contents, partner)
+        result = interpret(contents, partner, history)
     except Exception:
         log.exception("Interpretation failed")
         bot.reply_to(message, "Xatolik yuz berdi, birozdan so'ng qayta urinib ko'ring.")
@@ -164,6 +180,7 @@ def translate_and_reply(message, contents):
     if not result.text or not result.translation:
         bot.reply_to(message, "Nutq topilmadi.")
         return
+    history.append(result)
     target = partner if result.source_lang == "uz" else "uz"
     reply_with_translation(message, result, target)
     reply_with_voice(message, result.translation)
@@ -178,7 +195,8 @@ def start(message):
         "Ovozli yoki matnli xabar yuboring, tilini o'zim aniqlayman:\n"
         "• o'zbekcha bo'lsa, suhbatdosh tiliga tarjima qilaman;\n"
         "• boshqa tilda bo'lsa, o'zbekchaga tarjima qilaman.\n"
-        "Tarjimani matn va ovoz ko'rinishida yuboraman.\n\n"
+        "Suhbatning oldingi gaplarini hisobga olib tarjima qilaman, "
+        "natijani matn va ovoz ko'rinishida yuboraman.\n\n"
         "Suhbatdosh tilini tanlang (keyin /til bilan o'zgartirasiz):",
         reply_markup=lang_keyboard(partner),
     )
