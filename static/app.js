@@ -37,6 +37,8 @@ const player = new Audio();
 const speechQueue = [];
 let speaking = false;
 let wakeLock = null;
+const MAX_REPLAY = 5; // after a reconnect, only the newest unsent segments are still worth translating
+const MAX_REPLAY_AGE_MS = 30000;
 
 // ---------- connection ----------
 
@@ -53,9 +55,15 @@ function connect() {
     reconnectDelay = 1000;
     setStatus("online", "Ulangan");
     sendConfig();
-    for (const [, item] of pending) {
-      if (!item.sent) send(item);
-    }
+    const unsent = [...pending].filter(([, item]) => !item.sent);
+    unsent.forEach(([id, item], i) => {
+      if (i < unsent.length - MAX_REPLAY || Date.now() - item.at > MAX_REPLAY_AGE_MS) {
+        fail(id, "Aloqa yo'q edi");
+      } else {
+        item.replayed = true; // translate late, but don't read it aloud
+        send(item);
+      }
+    });
   };
   ws.onmessage = (event) => handleMessage(JSON.parse(event.data));
   ws.onclose = (event) => {
@@ -63,6 +71,13 @@ function connect() {
     if (event.code === 4401) {
       location.reload(); // session expired: show the login page
       return;
+    }
+    if (event.code === 4403) {
+      showWarning(
+        "Server ulanishni rad etdi: Origin va Host mos emas. nginx bo'lsa, " +
+          "proxy_set_header Host $http_host; qatorini qo'shing.",
+      );
+      return; // reconnecting would be rejected the same way
     }
     // Segments the server had not answered are lost with the connection.
     for (const [id, item] of pending) {
@@ -91,7 +106,7 @@ function handleMessage(msg) {
     if (!item) return;
     pending.delete(msg.id);
     fillCard(item.card, msg);
-    if (ui.tts.checked && config.tts) speak(msg.translation);
+    if (ui.tts.checked && config.tts && !item.replayed) speak(msg.translation);
   } else if (msg.type === "empty") {
     pending.get(msg.id)?.card.remove();
     pending.delete(msg.id);
@@ -169,9 +184,19 @@ function showWarning(text) {
 
 function onSegment(samples) {
   const id = ++seq;
-  const item = { card: addCard(), frame: packSegment(id, encodeWav(samples, SAMPLE_RATE)), sent: false };
+  const item = {
+    card: addCard(),
+    frame: packSegment(id, encodeWav(samples, SAMPLE_RATE)),
+    sent: false,
+    at: Date.now(),
+  };
   pending.set(id, item);
   send(item);
+  if (!item.sent) {
+    // offline: keep only the newest few in memory
+    const unsent = [...pending].filter(([, it]) => !it.sent);
+    unsent.slice(0, -MAX_REPLAY).forEach(([oldId]) => fail(oldId, "Aloqa yo'q edi"));
+  }
 }
 
 function onSpeech(active) {
@@ -181,7 +206,11 @@ function onSpeech(active) {
 
 async function openStream() {
   if (ui.source.value === "tab") {
-    const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true });
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      video: true,
+      audio: true,
+      selfBrowserSurface: "exclude", // sharing this tab would include our own read-out
+    });
     if (!stream.getAudioTracks().length) {
       stream.getTracks().forEach((t) => t.stop());
       throw new Error("Ovoz ulashilmadi: oynada «Tab ovozini ulashish» (Share tab audio) belgisini yoqing.");
@@ -200,8 +229,10 @@ async function start() {
   const ctx = new AudioContext();
   player.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
   player.play().catch(() => {});
+  let stream = null;
   try {
-    const stream = await openStream();
+    if (!ctx.audioWorklet) throw new Error("Brauzer eskirgan: AudioWorklet yo'q. Chrome, Edge, Firefox yoki Safari 14.5+ dan foydalaning.");
+    stream = await openStream();
     await ctx.audioWorklet.addModule("/static/pcm-worklet.js");
     const source = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, "capture");
@@ -212,7 +243,10 @@ async function start() {
     mute.connect(ctx.destination);
 
     const segmenter = new Segmenter({ onSegment, onSpeech });
-    capture = { ctx, stream, segmenter, paused: false };
+    // A captured browser tab contains only that tab's audio, so our read-out can't leak into it.
+    const surface = stream.getVideoTracks()[0]?.getSettings().displaySurface;
+    const hearsOutput = ui.source.value !== "tab" || surface !== "browser";
+    capture = { ctx, stream, segmenter, paused: false, hearsOutput };
     const down = new Downsampler(ctx.sampleRate, (frame) => {
       if (capture && !capture.paused) segmenter.push(frame);
     });
@@ -227,6 +261,7 @@ async function start() {
     keepAwake();
     drawLevel();
   } catch (err) {
+    stream?.getTracks().forEach((t) => t.stop());
     ctx.close();
     capture = null;
     showWarning(micError(err));
@@ -298,25 +333,35 @@ async function playNext() {
     });
     if (!res.ok) throw new Error(`TTS ${res.status}`);
     const url = URL.createObjectURL(await res.blob());
-    // Let whoever is talking finish, then mute the microphone while we speak
-    // so our own voice is not translated again.
-    await waitForPause(8000);
-    if (capture) {
-      capture.segmenter.flush();
-      capture.paused = true;
-      ui.hint.textContent = "🔊 Tarjima o'qilmoqda, mikrofon pauzada";
+    try {
+      if (capture?.hearsOutput) {
+        // Let whoever is talking finish, then mute the microphone while we speak
+        // so our own voice is not translated again.
+        await waitForPause(8000);
+        if (capture && ui.tts.checked) {
+          capture.segmenter.flush();
+          capture.paused = true;
+          ui.hint.textContent = "🔊 Tarjima o'qilmoqda, mikrofon pauzada";
+        }
+      }
+      // no early return here: playNext() below must run to clear `speaking`
+      if (ui.tts.checked) {
+        player.src = url;
+        await new Promise((resolve) => {
+          // "pause" too: switching read-out off stops the clip without an "ended" event
+          player.onended = player.onerror = player.onpause = resolve;
+          player.play().catch(resolve);
+        });
+      }
+    } finally {
+      URL.revokeObjectURL(url);
     }
-    player.src = url;
-    await new Promise((resolve) => {
-      player.onended = player.onerror = resolve;
-      player.play().catch(resolve);
-    });
-    URL.revokeObjectURL(url);
   } catch (err) {
     console.warn(err);
   } finally {
     setTimeout(() => {
-      if (capture && speechQueue.length === 0 && capture.paused) {
+      // not while the next clip is already on its way
+      if (capture && !speaking && capture.paused) {
         capture.segmenter.requireSilence(300); // don't send the tail of a phrase we only half heard
         capture.paused = false;
         ui.hint.textContent = "Tinglanmoqda…";

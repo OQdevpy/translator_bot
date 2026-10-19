@@ -43,6 +43,11 @@ class FakeSpeaker:
         return b"ID3-mp3"
 
 
+@pytest.fixture(autouse=True)
+def no_login_delay(monkeypatch):
+    monkeypatch.setattr(web, "LOGIN_FAIL_DELAY", 0)
+
+
 def client_for(interpreter=None, speaker=None, password=""):
     return TestClient(web.create_app(interpreter or FakeInterpreter(), speaker, password))
 
@@ -121,7 +126,8 @@ def test_websocket_requires_login():
 
 def test_websocket_rejects_other_origins():
     client = client_for()
-    expect_close(client, 4401, headers={"origin": "https://evil.example"})
+    # its own code, so the page warns instead of reloading forever
+    expect_close(client, 4403, headers={"origin": "https://evil.example"})
     with client.websocket_connect("/ws", headers={"origin": "http://testserver"}) as ws:
         ws.send_bytes(segment_frame(1))
         assert ws.receive_json()["type"] == "result"
@@ -273,3 +279,96 @@ def test_self_signed_certificate_is_generated_once(monkeypatch, tmp_path):
     assert web.ssl_files(str(tmp_path / "data")) == (cert, key)
     assert (tmp_path / "data" / "selfsigned.crt").stat().st_mtime_ns == mtime
     assert oct((tmp_path / "data" / "selfsigned.key").stat().st_mode & 0o777) == "0o600"
+
+
+def test_session_cookie_is_signed_and_expires(monkeypatch):
+    client = client_for(password="secret")
+    login(client)
+    value = client.cookies["stt_session"]
+    expires, _, signature = value.partition(".")
+    assert expires.isdigit() and len(signature) == 64
+    assert "secret" not in value
+
+    tampered = f"{int(expires) + 999}.{signature}"
+    client.cookies.set("stt_session", tampered)
+    assert client.get("/api/config").status_code == 401
+
+    client.cookies.set("stt_session", value)
+    assert client.get("/api/config").status_code == 200
+    real_time = web.time.time
+    monkeypatch.setattr(web.time, "time", lambda: real_time() + web.SESSION_SECONDS + 10)
+    assert client.get("/api/config").status_code == 401
+
+
+def test_session_survives_restart_with_the_same_secret():
+    secret = b"k" * 32
+    first = TestClient(web.create_app(FakeInterpreter(), None, "secret", secret))
+    login(first)
+    second = TestClient(web.create_app(FakeInterpreter(), None, "secret", secret))
+    second.cookies.update(first.cookies)
+    assert second.get("/api/config").status_code == 200
+
+
+def test_session_secret_file_is_created_once(tmp_path):
+    a = web.session_secret(str(tmp_path / "data"))
+    assert len(a) == 32 and web.session_secret(str(tmp_path / "data")) == a
+    assert oct((tmp_path / "data" / "session.key").stat().st_mode & 0o777) == "0o600"
+
+
+def test_login_is_locked_after_repeated_wrong_passwords():
+    client = client_for(password="secret")
+    for _ in range(web.LOGIN_FREE_FAILS):
+        assert client.post("/login", data={"password": "guess"}, follow_redirects=False).headers["location"] == "/?error=1"
+    locked = client.post("/login", data={"password": "secret"}, follow_redirects=False)
+    assert locked.headers["location"] == "/?error=locked"
+    assert "stt_session" not in client.cookies
+
+
+def test_a_few_typos_do_not_lock_the_owner_out():
+    client = client_for(password="secret")
+    for _ in range(web.LOGIN_FREE_FAILS - 1):
+        client.post("/login", data={"password": "typo"}, follow_redirects=False)
+    login(client)
+    assert client.get("/api/config").status_code == 200
+
+
+def test_non_object_json_does_not_kill_the_socket():
+    with client_for().websocket_connect("/ws") as ws:
+        for text in ("null", "1", "[]", '"x"', "{}"):
+            ws.send_text(text)
+        ws.send_bytes(segment_frame(1))
+        assert ws.receive_json()["type"] == "result"
+
+
+def test_reset_drops_queued_and_in_flight_segments():
+    interpreter = FakeInterpreter(
+        Interpretation(source_lang="ru", text="старое", translation="eski"),
+        Interpretation(source_lang="ru", text="очередь", translation="navbat"),
+        Interpretation(source_lang="ru", text="новое", translation="yangi"),
+    )
+    interpreter.gate = threading.Event()
+    with client_for(interpreter).websocket_connect("/ws") as ws:
+        ws.send_bytes(segment_frame(1))  # in flight (held by the gate)
+        time.sleep(0.2)
+        ws.send_bytes(segment_frame(2))  # queued
+        ws.send_text(json.dumps({"type": "reset"}))
+        time.sleep(0.2)
+        interpreter.gate.set()
+        ws.send_bytes(segment_frame(3))
+        msg = ws.receive_json()
+    assert msg["id"] == 3 and msg["translation"] == "navbat"  # segment 2 never reached Gemini
+    assert len(interpreter.calls) == 2
+    assert interpreter.calls[-1].history == []  # the old answer did not leak into the new context
+
+
+def test_target_is_the_partner_used_for_that_segment():
+    interpreter = FakeInterpreter(Interpretation(source_lang="uz", text="Salom", translation="你好"))
+    interpreter.gate = threading.Event()
+    with client_for(interpreter).websocket_connect("/ws") as ws:
+        ws.send_bytes(segment_frame(1))  # translated with the default partner (zh)
+        time.sleep(0.2)
+        ws.send_text(json.dumps({"type": "config", "partner": "tr"}))
+        time.sleep(0.1)
+        interpreter.gate.set()
+        msg = ws.receive_json()
+    assert interpreter.calls[0].partner == "zh" and msg["target"] == "zh"

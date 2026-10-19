@@ -130,3 +130,28 @@ def test_media_modality_enum_matches_rest_values():
         {"prompt_tokens_details": [{"modality": "AUDIO", "token_count": 3}]}
     )
     assert meta.prompt_tokens_details[0].modality == types.MediaModality.AUDIO
+
+
+def test_from_env_sets_a_request_timeout_and_tolerates_blank_values(monkeypatch, usage_log):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    for var in ("GEMINI_MODEL", "GEMINI_PRICE_IN", "GEMINI_PRICE_AUDIO_IN", "GEMINI_PRICE_OUT"):
+        monkeypatch.setenv(var, "")
+    it = Interpreter.from_env(usage_log)
+    assert (it.model, it.price_in, it.price_audio_in, it.price_out) == ("gemini-3.6-flash", 1.5, 1.5, 7.5)
+    assert it.client._api_client._http_options.timeout == translator.GEMINI_TIMEOUT_MS
+
+    monkeypatch.setenv("ELEVENLABS_API_KEY", "k")
+    monkeypatch.setenv("ELEVENLABS_MODEL", "")
+    monkeypatch.setenv("ELEVENLABS_VOICE_ID", "")
+    speaker = Speaker.from_env(usage_log)
+    assert speaker.model == "eleven_v3" and speaker.voice_id
+
+
+def test_history_is_copied_before_use(usage_log):
+    from collections import deque
+
+    captured = []
+    client = fake_gemini(captured, {"source_lang": "uz", "text": "a", "translation": "b"})
+    history = deque([Interpretation(source_lang="uz", text="x", translation="y")])
+    Interpreter(client, "m", usage_log).interpret("a", "zh", history)
+    assert "[uz] x => y" in system_text(captured[0])

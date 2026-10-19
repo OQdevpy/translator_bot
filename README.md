@@ -42,7 +42,26 @@ python bot.py   # bot
 2. Saytni `https://SERVER_IP:PORT` manzili orqali oching.
 3. Brauzer bir marta "xavfsiz emas" deb ogohlantiradi: "Advanced → Proceed" ni bosasiz, shundan keyin mikrofon ishlaydi.
 
-Domen va nginx (yoki Caddy) orqali ishlatilsa, `SSL_SELF_SIGNED` ni o'chiring. Proxy'da WebSocket'ni (`/ws`) ham uzating.
+Domen va nginx orqali ishlatilsa, `SSL_SELF_SIGNED` ni o'chiring va WebSocket'ni ham uzating:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $http_host;          # Origin bilan mos kelishi uchun port bilan birga
+    proxy_set_header X-Forwarded-For $remote_addr;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+`.env` ga `FORWARDED_ALLOW_IPS=*` qo'shing (port faqat nginx'ga ochiq bo'lsa). Shunda noto'g'ri parol
+urinishlari har bir foydalanuvchining haqiqiy IP'si bo'yicha cheklanadi.
+
+Kirish himoyasi:
+- Bitta IP'dan 5 marta noto'g'ri parol kiritilsa, kirish vaqtincha bloklanadi (1 daqiqadan 1 soatgacha).
+- Sessiya 30 kun amal qiladi.
 
 ## Saytdan foydalanish
 

@@ -47,6 +47,7 @@ HISTORY_PROMPT = (
     "names, pronouns and tone; translate only the new input:\n{history}"
 )
 HISTORY_SIZE = 10  # last exchanges given to Gemini as context
+GEMINI_TIMEOUT_MS = 60_000
 
 
 class Interpretation(BaseModel):
@@ -77,17 +78,22 @@ class Interpreter:
 
     @classmethod
     def from_env(cls, usage_log: UsageLog) -> "Interpreter":
-        price_in = float(os.getenv("GEMINI_PRICE_IN", "1.50"))
+        price_in = float(os.getenv("GEMINI_PRICE_IN") or 1.50)
         return cls(
-            genai.Client(api_key=os.environ["GEMINI_API_KEY"]),
-            os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+            genai.Client(
+                api_key=os.environ["GEMINI_API_KEY"],
+                # without a timeout a stalled connection would hang its thread forever
+                http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
+            ),
+            os.getenv("GEMINI_MODEL") or "gemini-3.6-flash",
             usage_log,
             price_in=price_in,
-            price_audio_in=float(os.getenv("GEMINI_PRICE_AUDIO_IN", str(price_in))),
-            price_out=float(os.getenv("GEMINI_PRICE_OUT", "7.50")),
+            price_audio_in=float(os.getenv("GEMINI_PRICE_AUDIO_IN") or price_in),
+            price_out=float(os.getenv("GEMINI_PRICE_OUT") or 7.50),
         )
 
     def interpret(self, contents, partner: str, history=(), live: bool = False) -> Interpretation:
+        history = list(history)  # a snapshot: callers may append from other threads
         system = INTERPRET_PROMPT.format(partner=LANGS[partner][2])
         if live:
             system += LIVE_PROMPT
@@ -149,8 +155,8 @@ class Speaker:
             return None
         return cls(
             api_key,
-            os.getenv("ELEVENLABS_MODEL", "eleven_v3"),
-            os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL"),  # Sarah (premade)
+            os.getenv("ELEVENLABS_MODEL") or "eleven_v3",
+            os.getenv("ELEVENLABS_VOICE_ID") or "EXAVITQu4vr4xnSDxMaL",  # Sarah (premade)
             usage_log,
         )
 
