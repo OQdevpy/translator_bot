@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0f172a">
+  <title>Jonli tarjimon</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="bar">
+    <h1>🎙️ Jonli tarjimon</h1>
+    <span id="status" class="status" data-state="connecting">Ulanmoqda…</span>
+    <form id="logout" method="post" action="/logout" hidden><button type="submit" class="link">Chiqish</button></form>
+  </header>
+
+  <section class="settings">
+    <label>Manba
+      <select id="source">
+        <option value="mic">🎤 Mikrofon</option>
+        <option value="tab">🖥️ Tab / ekran ovozi</option>
+      </select>
+    </label>
+    <label>O'zbekcha gap tarjimasi
+      <select id="partner"></select>
+    </label>
+    <label class="check" id="tts-label">
+      <input type="checkbox" id="tts"> 🔊 Tarjimani ovozli o'qish
+    </label>
+  </section>
+
+  <div id="warning" class="warning" role="alert" hidden></div>
+
+  <main id="transcript" class="transcript" aria-live="polite">
+    <div id="placeholder" class="placeholder">
+      <p class="big">▶ <b>Boshlash</b> tugmasini bosing va gapiring.</p>
+      <p>Xitoycha, ruscha, inglizcha, turkcha va boshqa tillardagi nutq real vaqtda <b>o'zbekchaga</b> tarjima qilinadi.
+        O'zbekcha gaplar yuqorida tanlangan tilga o'giriladi.</p>
+      <p class="muted">Har bir gap pauza qilinganda yuboriladi, tarjima 1–3 soniyada chiqadi.</p>
+    </div>
+  </main>
+
+  <footer class="bar controls">
+    <button id="copy" class="icon" title="Tarjimalarni nusxalash" aria-label="Tarjimalarni nusxalash">📋</button>
+    <div class="mic-wrap">
+      <button id="toggle" class="mic" data-state="idle">▶ Boshlash</button>
+      <div class="meter" aria-hidden="true"><div id="level"></div></div>
+      <div id="hint" class="hint">Tayyor</div>
+    </div>
+    <button id="clear" class="icon" title="Tozalash" aria-label="Tozalash">🗑</button>
+  </footer>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

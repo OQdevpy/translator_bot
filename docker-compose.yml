@@ -7,3 +7,17 @@ services:
       - .env
     volumes:
       - ./data:/app/data
+
+  stt_web:
+    build: .
+    container_name: stt_web
+    restart: unless-stopped
+    command: python web.py
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - ./data:/app/data

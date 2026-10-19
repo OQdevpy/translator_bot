@@ -1,0 +1,181 @@
+"""Gemini interpreter and ElevenLabs voice, shared by the Telegram bot and the web app."""
+import logging
+import os
+
+import requests
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
+from usage import UsageLog
+
+log = logging.getLogger("stt_bot")
+
+# code -> (flag, Uzbek name for buttons, name for the prompt)
+LANGS = {
+    "uz": ("🇺🇿", "O'zbekcha", "Uzbek (Latin script)"),
+    "zh": ("🇨🇳", "Xitoycha", "Simplified Chinese (Mandarin)"),
+    "tr": ("🇹🇷", "Turkcha", "Turkish"),
+    "en": ("🇬🇧", "Inglizcha", "English"),
+    "ru": ("🇷🇺", "Ruscha", "Russian"),
+}
+PARTNER_LANGS = [code for code in LANGS if code != "uz"]
+DEFAULT_PARTNER = "zh"
+
+INTERPRET_PROMPT = (
+    "You are an interpreter between an Uzbek speaker and a {partner} speaker. "
+    "Detect the language of the input (speech or text). "
+    "If it is Uzbek, translate it into {partner}; "
+    "if it is any other language, translate it into Uzbek (Latin script). "
+    "Translate the meaning naturally, as spoken language, not word by word. "
+    "Keep names, numbers and currencies as they are (e.g. 块/元 is yuan, not so'm).\n"
+    "Return JSON fields:\n"
+    "- source_lang: ISO 639-1 code of the input language (uz, zh, tr, en, ru, ...)\n"
+    "- text: the input in its original language; for audio the exact transcription, "
+    "empty if there is no speech\n"
+    "- translation: only the translation, no pinyin, quotes, notes or explanations"
+)
+LIVE_PROMPT = (
+    "\n\nThe input is the next fragment of continuous live speech, cut at a pause, "
+    "so it may start or end mid-sentence. Transcribe and translate only the words "
+    "in this fragment: do not repeat earlier fragments and do not complete unfinished "
+    "sentences. If it has no intelligible speech (silence, noise, music, coughing), "
+    "return empty text and translation."
+)
+HISTORY_PROMPT = (
+    "\n\nConversation so far, oldest first. Use it only as context to resolve meaning, "
+    "names, pronouns and tone; translate only the new input:\n{history}"
+)
+HISTORY_SIZE = 10  # last exchanges given to Gemini as context
+
+
+class Interpretation(BaseModel):
+    source_lang: str
+    text: str
+    translation: str
+
+
+class Interpreter:
+    """Detects the language of speech or text and translates it with Gemini."""
+
+    def __init__(
+        self,
+        client: genai.Client,
+        model: str,
+        usage_log: UsageLog,
+        price_in: float = 1.50,
+        price_audio_in: float | None = None,
+        price_out: float = 7.50,
+    ):
+        self.client = client
+        self.model = model
+        self.usage_log = usage_log
+        # USD per 1M tokens; output includes thinking tokens
+        self.price_in = price_in
+        self.price_audio_in = price_in if price_audio_in is None else price_audio_in
+        self.price_out = price_out
+
+    @classmethod
+    def from_env(cls, usage_log: UsageLog) -> "Interpreter":
+        price_in = float(os.getenv("GEMINI_PRICE_IN", "1.50"))
+        return cls(
+            genai.Client(api_key=os.environ["GEMINI_API_KEY"]),
+            os.getenv("GEMINI_MODEL", "gemini-3.6-flash"),
+            usage_log,
+            price_in=price_in,
+            price_audio_in=float(os.getenv("GEMINI_PRICE_AUDIO_IN", str(price_in))),
+            price_out=float(os.getenv("GEMINI_PRICE_OUT", "7.50")),
+        )
+
+    def interpret(self, contents, partner: str, history=(), live: bool = False) -> Interpretation:
+        system = INTERPRET_PROMPT.format(partner=LANGS[partner][2])
+        if live:
+            system += LIVE_PROMPT
+        if history:
+            system += HISTORY_PROMPT.format(
+                history="\n".join(f"[{h.source_lang}] {h.text} => {h.translation}" for h in history)
+            )
+        response = self.client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=0.2,
+                thinking_config=types.ThinkingConfig(thinking_level="low"),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                response_mime_type="application/json",
+                response_schema=Interpretation,
+            ),
+        )
+        self.record_usage(response.usage_metadata)
+        result = Interpretation.model_validate_json(response.text or "")
+        result.source_lang = result.source_lang.strip().lower()
+        result.text = result.text.strip()
+        result.translation = result.translation.strip()
+        return result
+
+    def record_usage(self, meta: types.GenerateContentResponseUsageMetadata | None):
+        if meta is None:
+            return
+        prompt = meta.prompt_token_count or 0
+        audio = sum(
+            d.token_count or 0
+            for d in meta.prompt_tokens_details or []
+            if d.modality == types.MediaModality.AUDIO
+        )
+        output = (meta.candidates_token_count or 0) + (meta.thoughts_token_count or 0)
+        cost = (
+            (prompt - audio) * self.price_in + audio * self.price_audio_in + output * self.price_out
+        ) / 1e6
+        self.usage_log.add("gemini", input_tokens=prompt, audio_tokens=audio, output_tokens=output, cost=cost)
+
+
+class Speaker:
+    """Text to speech with ElevenLabs."""
+
+    API = "https://api.elevenlabs.io/v1"
+
+    def __init__(self, api_key: str, model: str, voice_id: str, usage_log: UsageLog):
+        self.api_key = api_key
+        self.model = model
+        self.voice_id = voice_id
+        self.usage_log = usage_log
+
+    @classmethod
+    def from_env(cls, usage_log: UsageLog) -> "Speaker | None":
+        """None when ELEVENLABS_API_KEY is not set."""
+        api_key = os.getenv("ELEVENLABS_API_KEY")
+        if not api_key:
+            return None
+        return cls(
+            api_key,
+            os.getenv("ELEVENLABS_MODEL", "eleven_v3"),
+            os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL"),  # Sarah (premade)
+            usage_log,
+        )
+
+    def synthesize(self, text: str) -> bytes:
+        resp = requests.post(
+            f"{self.API}/text-to-speech/{self.voice_id}",
+            params={"output_format": "mp3_44100_128"},
+            headers={"xi-api-key": self.api_key},
+            json={"text": text, "model_id": self.model},
+            timeout=120,
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(f"ElevenLabs {resp.status_code}: {resp.text[:300]}")
+        cost = resp.headers.get("character-cost", "")
+        self.usage_log.add("elevenlabs", credits=int(cost) if cost.isdigit() else len(text))
+        return resp.content
+
+    def subscription(self) -> dict | None:
+        """Needs the "User: Read" permission on the API key; None when unavailable."""
+        try:
+            resp = requests.get(
+                f"{self.API}/user/subscription", headers={"xi-api-key": self.api_key}, timeout=20
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as e:
+            log.warning("ElevenLabs subscription unavailable: %s", e)
+            return None

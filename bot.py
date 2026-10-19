@@ -7,12 +7,9 @@ from collections import deque
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
-import requests
 import telebot
 from dotenv import load_dotenv
-from google import genai
 from google.genai import types
-from pydantic import BaseModel
 from telebot.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -21,57 +18,27 @@ from telebot.types import (
     InlineKeyboardMarkup,
 )
 
+from translator import (
+    DEFAULT_PARTNER,
+    HISTORY_SIZE,
+    LANGS,
+    PARTNER_LANGS,
+    Interpretation,
+    Interpreter,
+    Speaker,
+)
 from usage import Totals, UsageLog
 
 load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
-ELEVENLABS_API_KEY = os.environ["ELEVENLABS_API_KEY"]
-ELEVENLABS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_v3")
-ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "EXAVITQu4vr4xnSDxMaL")  # Sarah (premade)
-
 # Telegram user IDs allowed to see /usage and receive the daily report
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split()}
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
 REPORT_TIME = os.getenv("REPORT_TIME", "21:00")  # daily report, local time
 DATA_DIR = os.getenv("DATA_DIR", "data")
-# USD per 1M tokens; output includes thinking tokens
-GEMINI_PRICE_IN = float(os.getenv("GEMINI_PRICE_IN", "1.50"))
-GEMINI_PRICE_AUDIO_IN = float(os.getenv("GEMINI_PRICE_AUDIO_IN", str(GEMINI_PRICE_IN)))
-GEMINI_PRICE_OUT = float(os.getenv("GEMINI_PRICE_OUT", "7.50"))
 GEMINI_MONTHLY_BUDGET = float(os.getenv("GEMINI_MONTHLY_BUDGET_USD") or 0)  # 0: not shown
 
-# code -> (flag, Uzbek name for buttons, name for the prompt)
-LANGS = {
-    "uz": ("🇺🇿", "O'zbekcha", "Uzbek (Latin script)"),
-    "zh": ("🇨🇳", "Xitoycha", "Simplified Chinese (Mandarin)"),
-    "tr": ("🇹🇷", "Turkcha", "Turkish"),
-    "en": ("🇬🇧", "Inglizcha", "English"),
-    "ru": ("🇷🇺", "Ruscha", "Russian"),
-}
-PARTNER_LANGS = [code for code in LANGS if code != "uz"]
-DEFAULT_PARTNER = "zh"
-
-INTERPRET_PROMPT = (
-    "You are an interpreter between an Uzbek speaker and a {partner} speaker. "
-    "Detect the language of the input (speech or text). "
-    "If it is Uzbek, translate it into {partner}; "
-    "if it is any other language, translate it into Uzbek (Latin script). "
-    "Translate the meaning naturally, as spoken language, not word by word. "
-    "Keep names, numbers and currencies as they are (e.g. 块/元 is yuan, not so'm).\n"
-    "Return JSON fields:\n"
-    "- source_lang: ISO 639-1 code of the input language (uz, zh, tr, en, ru, ...)\n"
-    "- text: the input in its original language; for audio the exact transcription, "
-    "empty if there is no speech\n"
-    "- translation: only the translation, no pinyin, quotes, notes or explanations"
-)
-HISTORY_PROMPT = (
-    "\n\nConversation so far, oldest first. Use it only as context to resolve meaning, "
-    "names, pronouns and tone; translate only the new input:\n{history}"
-)
-HISTORY_SIZE = 10  # last exchanges per chat given to Gemini as context
 TEXT_LIMIT = 3500  # below Telegram's 4096 after HTML markup
 COPY_LIMIT = 256  # Telegram's limit for copy_text buttons
 
@@ -79,92 +46,16 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("stt_bot")
 
-client = genai.Client(api_key=GEMINI_API_KEY)
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 usage_log = UsageLog(os.path.join(DATA_DIR, "usage.db"))
-
-
-class Interpretation(BaseModel):
-    source_lang: str
-    text: str
-    translation: str
-
+interpreter = Interpreter.from_env(usage_log)
+speaker = Speaker.from_env(usage_log)  # None without ELEVENLABS_API_KEY: text only
 
 # Both kept in memory, so they reset on restart.
 # chat_id -> partner language code
 partner_langs: dict[int, str] = {}
 # chat_id -> recent exchanges, used as translation context
 histories: dict[int, deque[Interpretation]] = {}
-
-
-def interpret(contents, partner: str, history=()) -> Interpretation:
-    system = INTERPRET_PROMPT.format(partner=LANGS[partner][2])
-    if history:
-        system += HISTORY_PROMPT.format(
-            history="\n".join(f"[{h.source_lang}] {h.text} => {h.translation}" for h in history)
-        )
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=system,
-            temperature=0.2,
-            thinking_config=types.ThinkingConfig(thinking_level="low"),
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            response_mime_type="application/json",
-            response_schema=Interpretation,
-        ),
-    )
-    record_gemini_usage(response.usage_metadata)
-    result = Interpretation.model_validate_json(response.text or "")
-    result.source_lang = result.source_lang.strip().lower()
-    result.text = result.text.strip()
-    result.translation = result.translation.strip()
-    return result
-
-
-def synthesize(text: str) -> bytes:
-    resp = requests.post(
-        f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}",
-        params={"output_format": "mp3_44100_128"},
-        headers={"xi-api-key": ELEVENLABS_API_KEY},
-        json={"text": text, "model_id": ELEVENLABS_MODEL},
-        timeout=120,
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(f"ElevenLabs {resp.status_code}: {resp.text[:300]}")
-    cost = resp.headers.get("character-cost", "")
-    usage_log.add("elevenlabs", credits=int(cost) if cost.isdigit() else len(text))
-    return resp.content
-
-
-def record_gemini_usage(meta: types.GenerateContentResponseUsageMetadata | None):
-    if meta is None:
-        return
-    prompt = meta.prompt_token_count or 0
-    audio = sum(
-        d.token_count or 0
-        for d in meta.prompt_tokens_details or []
-        if d.modality == types.MediaModality.AUDIO
-    )
-    output = (meta.candidates_token_count or 0) + (meta.thoughts_token_count or 0)
-    cost = ((prompt - audio) * GEMINI_PRICE_IN + audio * GEMINI_PRICE_AUDIO_IN + output * GEMINI_PRICE_OUT) / 1e6
-    usage_log.add("gemini", input_tokens=prompt, audio_tokens=audio, output_tokens=output, cost=cost)
-
-
-def elevenlabs_subscription() -> dict | None:
-    """Needs the "User: Read" permission on the API key; None when unavailable."""
-    try:
-        resp = requests.get(
-            "https://api.elevenlabs.io/v1/user/subscription",
-            headers={"xi-api-key": ELEVENLABS_API_KEY},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        log.warning("ElevenLabs subscription unavailable: %s", e)
-        return None
 
 
 def num(n: int) -> str:
@@ -191,29 +82,30 @@ def usage_report() -> str:
     lines = [
         f"📊 <b>Usage</b> · {now:%d.%m.%Y %H:%M}",
         "",
-        f"🤖 <b>Gemini</b> ({html.escape(GEMINI_MODEL)})",
+        f"🤖 <b>Gemini</b> ({html.escape(interpreter.model)})",
         f"Bugun: {gemini_line(g_day)}",
         f"Shu oy: {gemini_line(g_month)}",
     ]
     if GEMINI_MONTHLY_BUDGET:
         left = GEMINI_MONTHLY_BUDGET - g_month.cost
         lines.append(f"Oylik limitdan qoldi: <b>≈ ${left:.2f}</b> / ${GEMINI_MONTHLY_BUDGET:.2f}")
-    lines += [
-        "",
-        f"🔊 <b>ElevenLabs</b> ({html.escape(ELEVENLABS_MODEL)})",
-        f"Bugun: {e_day.requests} so'rov · {num(e_day.credits)} kredit",
-        f"Shu oy: {e_month.requests} so'rov · {num(e_month.credits)} kredit",
-    ]
-    sub = elevenlabs_subscription()
-    if sub:
-        used, limit = sub["character_count"], sub["character_limit"]
-        reset = datetime.fromtimestamp(sub["next_character_count_reset_unix"], TIMEZONE)
-        lines.append(
-            f"Obuna ({html.escape(str(sub.get('tier')))}): {num(used)} / {num(limit)} kredit, "
-            f"qoldi <b>{num(limit - used)}</b> (yangilanadi {reset:%d.%m})"
-        )
-    else:
-        lines.append("Qolgan kredit: API kalitga «User → Read» ruxsatini bering")
+    if speaker:
+        lines += [
+            "",
+            f"🔊 <b>ElevenLabs</b> ({html.escape(speaker.model)})",
+            f"Bugun: {e_day.requests} so'rov · {num(e_day.credits)} kredit",
+            f"Shu oy: {e_month.requests} so'rov · {num(e_month.credits)} kredit",
+        ]
+        sub = speaker.subscription()
+        if sub:
+            used, limit = sub["character_count"], sub["character_limit"]
+            reset = datetime.fromtimestamp(sub["next_character_count_reset_unix"], TIMEZONE)
+            lines.append(
+                f"Obuna ({html.escape(str(sub.get('tier')))}): {num(used)} / {num(limit)} kredit, "
+                f"qoldi <b>{num(limit - used)}</b> (yangilanadi {reset:%d.%m})"
+            )
+        else:
+            lines.append("Qolgan kredit: API kalitga «User → Read» ruxsatini bering")
     lines += [
         "",
         "<i>Gemini summasi bot hisoblagan taxminiy narx: Google balansni API orqali bermaydi.</i>",
@@ -294,9 +186,11 @@ def reply_with_translation(message, result: Interpretation, target: str):
 
 
 def reply_with_voice(message, text: str):
+    if speaker is None:
+        return
     bot.send_chat_action(message.chat.id, "record_voice")
     try:
-        audio = synthesize(text)
+        audio = speaker.synthesize(text)
     except Exception:
         log.exception("TTS failed")
         bot.reply_to(message, "🔇 Ovoz yaratib bo'lmadi, tarjima yuqorida matn ko'rinishida.")
@@ -309,7 +203,7 @@ def translate_and_reply(message, contents):
     history = histories.setdefault(message.chat.id, deque(maxlen=HISTORY_SIZE))
     bot.send_chat_action(message.chat.id, "typing")
     try:
-        result = interpret(contents, partner, history)
+        result = interpreter.interpret(contents, partner, history)
     except Exception:
         log.exception("Interpretation failed")
         bot.reply_to(message, "Xatolik yuz berdi, birozdan so'ng qayta urinib ko'ring.")
@@ -424,5 +318,5 @@ if __name__ == "__main__":
             log.warning("Admin commands for %s not set: %s", admin_id, e)
     if ADMIN_IDS:
         threading.Thread(target=daily_report_loop, daemon=True).start()
-    log.info("Bot ishga tushdi (gemini: %s, elevenlabs: %s)", GEMINI_MODEL, ELEVENLABS_MODEL)
+    log.info("Bot ishga tushdi (gemini: %s, elevenlabs: %s)", interpreter.model, speaker and speaker.model)
     bot.infinity_polling(timeout=30, long_polling_timeout=25)

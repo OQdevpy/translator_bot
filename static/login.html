@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="uz">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Kirish · Jonli tarjimon</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎙️</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login">
+  <form method="post" action="/login" class="login-card">
+    <h1>🎙️ Jonli tarjimon</h1>
+    <label>Parol
+      <input type="password" name="password" autocomplete="current-password" required autofocus>
+    </label>
+    <p id="error" class="error" hidden>Parol noto'g'ri</p>
+    <button type="submit" class="mic">Kirish</button>
+  </form>
+  <script>
+    if (new URLSearchParams(location.search).has("error")) document.getElementById("error").hidden = false;
+  </script>
+</body>
+</html>
