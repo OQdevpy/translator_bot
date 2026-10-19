@@ -93,16 +93,24 @@ class Interpreter:
         system: str,
         schema: type[T],
         thinking: str = "low",
-        temperature: float = 0.2,
+        temperature: float | None = None,
         model: str | None = None,
+        timeout: float | None = None,
+        max_tokens: int | None = None,
     ) -> T:
-        """One structured Gemini call; usage and cost are recorded."""
+        """One structured Gemini call; usage and cost are recorded.
+
+        temperature None keeps the model's default: Gemini 3 is tuned for 1.0, and lower values can make
+        it loop. timeout (seconds) replaces the client's for this call: a long report needs minutes, a live
+        phrase is better retried than awaited. max_tokens (thinking included) stops a looping answer early."""
         response = self.client.models.generate_content(
             model=model or self.model,
             contents=contents,
             config=types.GenerateContentConfig(
                 system_instruction=system,
                 temperature=temperature,
+                max_output_tokens=max_tokens,
+                http_options=None if timeout is None else types.HttpOptions(timeout=int(timeout * 1000)),
                 thinking_config=types.ThinkingConfig(thinking_level=thinking),
                 automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
                 response_mime_type="application/json",

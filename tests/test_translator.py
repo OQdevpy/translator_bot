@@ -17,8 +17,9 @@ def usage_log(tmp_path):
     return UsageLog(str(tmp_path / "usage.db"))
 
 
-def fake_gemini(captured, payload, usage=None, paths=None):
-    """A real genai.Client whose HTTP layer returns `payload` and records the request body (and path).
+def fake_gemini(captured, payload, usage=None, paths=None, options=None):
+    """A real genai.Client whose HTTP layer returns `payload` and records the request body (and path,
+    and the per-request HTTP options).
 
     payload None means a response without candidates, as when Gemini blocks a prompt."""
     client = genai.Client(api_key="fake")
@@ -27,6 +28,8 @@ def fake_gemini(captured, payload, usage=None, paths=None):
         captured.append(body)
         if paths is not None:
             paths.append(path)
+        if options is not None:
+            options.append(http_options)
         if payload is None:
             response = {"promptFeedback": {"blockReason": "SAFETY"}}
         else:
@@ -212,11 +215,23 @@ def thinking_level(body):
     return thinking.get("thinkingLevel") or thinking.get("thinking_level")
 
 
-def test_generate_defaults_low_thinking_and_low_temperature(usage_log):
-    captured = []
-    Interpreter(fake_gemini(captured, BASKET), "m", usage_log).generate("x", "s", Basket)
+def test_generate_defaults_low_thinking_and_the_models_own_temperature(usage_log):
+    captured, options = [], []
+    Interpreter(fake_gemini(captured, BASKET, options=options), "m", usage_log).generate("x", "s", Basket)
     assert thinking_level(captured[0]) == "LOW"
-    assert captured[0]["generationConfig"]["temperature"] == pytest.approx(0.2)
+    # Gemini 3 is tuned for its default temperature (lower values can make it loop)
+    assert "temperature" not in captured[0]["generationConfig"]
+    assert "maxOutputTokens" not in captured[0]["generationConfig"]
+    assert options == [None]  # the client's own timeout applies
+
+
+def test_generate_per_call_timeout_and_output_cap(usage_log):
+    captured, options = [], []
+    interpreter = Interpreter(fake_gemini(captured, BASKET, options=options), "m", usage_log)
+    interpreter.generate("x", "s", Basket, timeout=600, max_tokens=32768)
+    interpreter.generate("x", "s", Basket, timeout=2.5, max_tokens=100)
+    assert [o.timeout for o in options] == [600_000, 2500]  # milliseconds
+    assert [b["generationConfig"]["maxOutputTokens"] for b in captured] == [32768, 100]
 
 
 def test_generate_passes_thinking_temperature_and_model_override(usage_log):
@@ -298,20 +313,24 @@ def test_generate_sends_audio_parts_inline(usage_log):
 
 
 def test_report_call_uses_the_report_model_and_medium_thinking(usage_log):
-    """SeminarAI.report goes through Interpreter.generate with its own model and more thinking."""
+    """SeminarAI.report goes through Interpreter.generate with its own model, more thinking and a long timeout."""
+    import seminar
     from seminar import Report, SeminarAI
 
     report = {
         "title": "T", "overview": "O", "speakers": [], "timeline": [], "topics": [], "qa": [],
         "decisions": [], "action_items": [], "glossary": [],
     }
-    captured, paths = [], []
-    interpreter = Interpreter(fake_gemini(captured, report, paths=paths), "flash", usage_log)
+    captured, paths, options = [], [], []
+    interpreter = Interpreter(fake_gemini(captured, report, paths=paths, options=options), "flash", usage_log)
     result = SeminarAI(interpreter, report_model="pro").report("[09:00] S1 (Ali): Salom", "S1: Ali", "period")
+    # the client-wide timeout is for live calls; a day-long report gets minutes
+    assert options[0].timeout == seminar.REPORT_TIMEOUT * 1000 > translator.GEMINI_TIMEOUT_MS
     assert isinstance(result, Report) and result.title == "T"
     assert paths == ["models/pro:generateContent"]
     assert thinking_level(captured[0]) == "MEDIUM"
-    assert captured[0]["generationConfig"]["temperature"] == pytest.approx(0.3)
+    assert "temperature" not in captured[0]["generationConfig"]
+    assert captured[0]["generationConfig"]["maxOutputTokens"] == seminar.REPORT_MAX_TOKENS
 
     paths.clear()
     SeminarAI(interpreter).report("t", "s", "p")  # no report model configured: the main model

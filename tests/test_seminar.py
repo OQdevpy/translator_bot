@@ -7,6 +7,7 @@ import threading
 import time
 from contextlib import closing
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -52,10 +53,10 @@ class FakeAI:
         self.report_calls = []
         self.report_result = make_report()
 
-    def listen(self, wav, references, similarities, recent, notes):
+    def listen(self, wav, references, similarities, recent, notes, identified=None):
         self.listen_calls.append(
             {"wav": wav, "references": [r["id"] for r in references], "similarities": dict(similarities),
-             "recent": list(recent), "notes": dict(notes)}
+             "recent": list(recent), "notes": dict(notes), "identified": identified}
         )
         result = self.listen_results.pop(0)
         if callable(result) and not isinstance(result, Heard):
@@ -252,12 +253,13 @@ def test_seminar_ai_listen_builds_prompt_and_normalizes():
     result = ai.listen(b"RIFF-new", refs, {"S1": 0.7012}, ["[S1 Aziz] earlier"], notes)
     assert (result.speaker, result.speaker_name, result.source_lang, result.text) == ("S1", "Aziz", "en", "Hello there")
     call = interp.calls[0]
-    assert call["schema"] is Heard and call["kw"]["temperature"] == 0.1
+    # a short timeout and answer cap: a stuck or looping call must not hold up the live queue
+    assert call["schema"] is Heard and call["kw"] == {"timeout": seminar.LISTEN_TIMEOUT, "max_tokens": seminar.LISTEN_MAX_TOKENS}
     contents = call["contents"]
     assert contents[0] == "Reference recording of speaker S1 (Aziz; voice not described):"
     assert contents[1].inline_data.data == b"RIFF-ref"
     assert contents[2] == "NEW SEGMENT:" and contents[3].inline_data.data == b"RIFF-new"
-    assert "   - S1: 0.70" in call["system"]
+    assert "   - S1: 0.70" in call["system"] and "0.62 or more, different people 0.30 or less" in call["system"]
     # listening needs only the spellings; the summary is for interpreting (and costs tokens on every phrase)
     assert "KPI = asosiy ko'rsatkich" in call["system"] and "Xulosa" not in call["system"]
     assert "[S1 Aziz] earlier" in call["system"]
@@ -275,6 +277,7 @@ def test_seminar_ai_interpret_target_and_source_names():
     assert (result.translation, result.note) == ("Привет", "izoh")
     assert "working into Russian" in interp.calls[0]["system"]
     assert interp.calls[0]["contents"] == "Aziz (Uzbek (Latin script)): Salom"
+    assert interp.calls[0]["kw"] == {"timeout": seminar.INTERPRET_TIMEOUT, "max_tokens": seminar.INTERPRET_MAX_TOKENS}
     ai.interpret("Hallo", "de", "S2", "xx", ["[A] b"], {})  # unknown codes: raw source code, Uzbek target
     assert interp.calls[1]["contents"] == "S2 (de): Hallo"
     assert "working into Uzbek (Latin script)" in interp.calls[1]["system"]
@@ -284,14 +287,19 @@ def test_seminar_ai_interpret_target_and_source_names():
 def test_seminar_ai_notes_and_report_calls():
     interp = FakeInterpreter(Notes(summary="s", glossary=[]))
     ai = SeminarAI(interp, report_model="gemini-pro-test")
-    ai.update_notes({"summary": "Eski"}, ["[A] x => y"], ["S1 = A"])
+    ai.update_notes({"summary": "Eski"}, ["[A] x => y"], ["A", "Spiker 2"])
     contents = interp.calls[0]["contents"]
-    assert "Current notes:\nEski" in contents and "Speakers: S1 = A" in contents and "[A] x => y" in contents
+    assert "Current notes:\nEski" in contents and "Speakers: A, Spiker 2" in contents and "[A] x => y" in contents
+    assert "never use ids like S1" in interp.calls[0]["system"]  # the summary is shown on every device
+    assert interp.calls[0]["kw"] == {"timeout": seminar.NOTES_TIMEOUT, "max_tokens": seminar.NOTES_MAX_TOKENS}
     interp.result = make_report()
     ai.report("TRANSCRIPT", "S1: A", "PERIOD")
     call = interp.calls[1]
     assert call["schema"] is Report
-    assert call["kw"] == {"thinking": "medium", "temperature": 0.3, "model": "gemini-pro-test"}
+    # a day-long report needs minutes, far beyond the live calls' timeout
+    assert call["kw"] == {"thinking": "medium", "model": "gemini-pro-test", "timeout": seminar.REPORT_TIMEOUT,
+                          "max_tokens": seminar.REPORT_MAX_TOKENS}
+    assert seminar.REPORT_TIMEOUT >= 300
     assert "Period: PERIOD" in call["contents"] and "TRANSCRIPT" in call["contents"]
 
 
@@ -469,7 +477,7 @@ def test_strong_voice_match_overrides_gemini(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -489,13 +497,13 @@ def test_strong_voice_match_overrides_gemini(store, sid):
 
 def test_clearly_new_voice_creates_speaker_despite_gemini(store, sid):
     seed_speaker(store, sid, "S1", label="Aziz", centroid=E1, samples=4, named=True)
-    emb = toward(E1, E2, 0.2)
+    emb = toward(E1, E2, 0.1)  # a long clip, very unlike anyone known
     wav = make_wav(3.0)
     ai = FakeAI([heard("Yangi odam", speaker="S1", voice="ayol ovozi")])
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
-        await sess.add_audio(1, wav, T0)
+        await sess.add_audio(1, wav, T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -523,10 +531,10 @@ def test_ambiguous_voice_defers_to_gemini_and_updates_centroid_only_when_confide
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([disagree, agree]))
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         after_first = {k: (sp["centroid"].copy(), sp["samples"]) for k, sp in sess.speakers.items()}
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws, after_first
@@ -551,8 +559,8 @@ def test_ambiguous_voice_and_gemini_says_new_or_unknown_id_creates_speakers(stor
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints(embs))
-        await sess.add_audio(1, make_wav(2.0), T0)
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -575,7 +583,7 @@ def test_gemini_names_speaker_without_voiceprint_when_voice_is_new(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -597,7 +605,7 @@ def test_without_voiceprints_gemini_decides(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i in range(4):
-            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -618,7 +626,7 @@ def test_voiceprint_failure_falls_back_to_gemini(store, sid, failure):
 
     async def main():
         sess, ws = start(store, sid, ai, vp)
-        await sess.add_audio(1, make_wav(0.5), T0)
+        await sess.add_audio(1, make_wav(0.5), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -643,7 +651,7 @@ def test_speaker_name_sets_label_once(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i in range(5):  # one at a time: the label at interpretation time is then deterministic
-            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
             await drain(sess)
         sess.close()
         return sess, ws
@@ -664,7 +672,7 @@ def test_user_rename_is_never_overridden_by_gemini(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         await sess.rename_speaker("S1", "Rais")
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -684,7 +692,7 @@ def test_reference_clip_replaced_only_by_better_clip(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i, wav in enumerate(clips):
-            await sess.add_audio(i, wav, T0 + 20 * i)
+            await sess.add_audio(i, wav, T0 + 20 * i, origin=ws)
             await drain(sess)
             refs.append((sess.speakers["S1"]["ref_wav"], sess.speakers["S1"]["ref_seconds"]))
         sess.close()
@@ -711,8 +719,8 @@ def test_listen_gets_ranked_references_recent_lines_and_notes(store, sid, monkey
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([emb, emb]))
-        await sess.add_audio(1, make_wav(2.0), T0)
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -724,27 +732,36 @@ def test_listen_gets_ranked_references_recent_lines_and_notes(store, sid, monkey
 
 
 @pytest.mark.parametrize(
-    "emb, has_unknown_voice, sends",
+    "emb, seconds, unknown_voice, sends",
     [
-        (E1, False, False),  # surely S1: no need for Gemini to compare voices
-        (E1, True, False),  # surely S1 even with a speaker of unknown voice around
-        (E3, False, False),  # surely someone new
-        (E3, True, True),  # clearly not S1/S2, but maybe the speaker whose voice is unknown
-        (0.6 * E1 + 0.8 * E3, False, True),  # ambiguous
-        (None, False, True),  # no voiceprint for this phrase (too short)
+        (E1, 2.0, None, False),  # surely S1: no need for Gemini to compare voices
+        (E1, 2.0, "recent", False),  # surely S1 even with a speaker of unknown voice around
+        (E3, 3.0, None, False),  # a long clip unlike anyone: surely someone new
+        (E3, 2.0, None, True),  # a short clip scores low even for a known person: Gemini compares
+        (toward(E1, E3, 0.25), 3.0, None, True),  # unlike everyone, but not clearly enough
+        (E3, 3.0, "recent", True),  # clearly not S1/S2, but maybe the speaker whose voice is unknown
+        (E3, 3.0, "tiny-ref", False),  # ...whose only clip is too short to compare with
+        (E3, 3.0, "silent", False),  # ...who hasn't spoken for over half an hour
+        (0.6 * E1 + 0.8 * E3, 2.0, None, True),  # ambiguous
+        (None, 2.0, None, True),  # no voiceprint for this phrase (too short)
     ],
-    ids=["same", "same-with-unknown", "new", "new-or-unknown", "ambiguous", "no-voiceprint"],
+    ids=["same", "same-with-unknown", "new", "short-clip", "unlike-but-not-clearly", "new-or-unknown",
+         "unknown-with-tiny-ref", "unknown-long-silent", "ambiguous", "no-voiceprint"],
 )
-def test_reference_recordings_only_when_voiceprints_cannot_decide(store, sid, emb, has_unknown_voice, sends):
+def test_reference_recordings_only_when_voiceprints_cannot_decide(store, sid, emb, seconds, unknown_voice, sends):
     seed_speaker(store, sid, "S1", centroid=E1, ref_wav=b"R1")
     seed_speaker(store, sid, "S2", centroid=E2, ref_wav=b"R2")
-    if has_unknown_voice:
-        seed_speaker(store, sid, "S3", centroid=None, ref_wav=b"R3")
+    store.add_segment(sid, {"start": T0 - 2, "end": T0, "speaker": "S1", "lang": "uz", "text": "x", "complete": True})
+    if unknown_voice:
+        seed_speaker(store, sid, "S3", centroid=None, ref_wav=b"R3", ref_seconds=0.6 if unknown_voice == "tiny-ref" else 5.0)
+        spoke = T0 - 31 * 60 if unknown_voice == "silent" else T0 - 60
+        store.add_segment(sid, {"start": spoke - 2, "end": spoke, "speaker": "S3", "lang": "uz", "text": "y",
+                                "complete": True})
     ai = FakeAI([heard("gap", speaker="S1")])
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(seconds), T0 + 5, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -760,7 +777,7 @@ def test_complete_phrase_becomes_a_unit(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(5, make_wav(2.0), T0)
+        await sess.add_audio(5, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -778,7 +795,7 @@ def test_complete_phrase_becomes_a_unit(store, sid):
     assert ws.types().index("heard") < ws.types().index("unit")
     assert ws.of("pending")[-1] == {"type": "pending", "pending": [], "interpreting": 0}
     assert sess.pending == [] and store.pending_segments(sid) == [] and not sess.busy()
-    assert list(sess.recent_units) == ["[Spiker 1] T:Assalomu alaykum."]
+    assert sess.recent_interpretation() == ["[Spiker 1] T:Assalomu alaykum."]
 
 
 def test_incomplete_then_complete_phrase_join_into_one_unit(store, sid):
@@ -787,12 +804,12 @@ def test_incomplete_then_complete_phrase_join_into_one_unit(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
         assert sess.idle_timer is not None and store.units(sid) == []
         assert ws.of("pending")[-1] == {"type": "pending", "interpreting": 0,
                                         "pending": [{"speaker": "S1", "lang": "uz", "text": "Bugun biz"}]}
-        await sess.add_audio(2, make_wav(3.0), T0 + 4)
+        await sess.add_audio(2, make_wav(3.0), T0 + 4, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -812,8 +829,8 @@ def test_speaker_change_flushes_previous_thought(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         units = store.units(sid)
         pending = [p["text"] for p in sess.pending]
@@ -831,7 +848,7 @@ def test_idle_pause_flushes_thought(store, sid, monkeypatch):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await wait_for(lambda: len(store.units(sid)) == 1)
         await drain(sess)
         sess.close()
@@ -851,11 +868,11 @@ def test_idle_flush_waits_while_more_speech_is_queued(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         try:
-            await sess.add_audio(1, make_wav(2.0), T0)
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
             await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
-            await sess.add_audio(2, make_wav(2.0), T0 + 3)
+            await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
             await asyncio.to_thread(entered.wait, 5)
-            await sess.add_audio(3, make_wav(2.0), T0 + 6)  # waits in the queue
+            await sess.add_audio(3, make_wav(2.0), T0 + 6, origin=ws)  # waits in the queue
             sess._idle_flush()
             assert len(sess.pending) == 1 and sess.unit_queue.empty()
             assert sess.idle_timer is not None  # re-armed
@@ -877,10 +894,10 @@ def test_idle_flush_waits_for_phrase_being_transcribed(store, sid, monkeypatch):
     async def main():
         sess, ws = start(store, sid, ai, None)
         try:
-            await sess.add_audio(1, make_wav(2.0), T0)
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
             await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
             # the continuation arrives well inside the idle window, transcription is slow
-            await sess.add_audio(2, make_wav(2.0), T0 + 1)
+            await sess.add_audio(2, make_wav(2.0), T0 + 1, origin=ws)
             await asyncio.to_thread(entered.wait, 5)
             await asyncio.sleep(0.3)
         finally:
@@ -900,7 +917,7 @@ def test_unit_max_seconds_flushes_unfinished_thought(store, sid, monkeypatch):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i in range(3):
-            await sess.add_audio(i, make_wav(3.0), T0 + 3 * i)
+            await sess.add_audio(i, make_wav(3.0), T0 + 3 * i, origin=ws)
         await drain(sess)
         pending = [p["text"] for p in sess.pending]
         sess.close()
@@ -922,7 +939,7 @@ def test_explicit_flush(store, sid):
             sess.flush()  # nothing pending: no-op
             await asyncio.sleep(0)
             assert sess.unit_queue.empty() and ws.messages == []
-            await sess.add_audio(1, make_wav(2.0), T0)
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
             await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
             assert sess.idle_timer is not None
             sess.flush()
@@ -945,11 +962,11 @@ def test_empty_transcription_is_ignored(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, FakeVoiceprints([None, None, None]))
-        await sess.add_audio(1, make_wav(2.0), T0)
-        await sess.add_audio(2, make_wav(1.0), T0 + 2)  # applause
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await sess.add_audio(2, make_wav(1.0), T0 + 2, origin=ws)  # applause
         await wait_for(lambda: len(ai.listen_calls) == 2 and sess.working == 0)
         assert len(sess.pending) == 1 and len(sess.speakers) == 1 and len(store.pending_segments(sid)) == 1
-        await sess.add_audio(3, make_wav(2.0), T0 + 5)
+        await sess.add_audio(3, make_wav(2.0), T0 + 5, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -982,7 +999,7 @@ def test_target_language(store, partner, langs, expected):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i in range(len(langs)):
-            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -999,10 +1016,10 @@ def test_set_partner_applies_to_next_thought_and_persists(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.set_partner("zh")
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -1014,36 +1031,78 @@ def test_set_partner_applies_to_next_thought_and_persists(store, sid):
 # ---------------------------------------------------------------- failures and retries
 
 
-def test_listen_retries_once_then_succeeds(store, sid):
-    ai = FakeAI([RuntimeError("503"), heard("salom", speaker="new")])
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """seminar's asyncio.sleep and time.monotonic on a fake clock: sleeping advances it at once.
+    Returns the list of sleeps."""
+    clock, sleeps = [1000.0], []
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay, *args):
+        sleeps.append(delay)
+        clock[0] += delay
+        await real_sleep(0)
+
+    fake_asyncio = SimpleNamespace(**{k: getattr(asyncio, k) for k in dir(asyncio) if not k.startswith("__")})
+    fake_asyncio.sleep = sleep
+    monkeypatch.setattr(seminar, "asyncio", fake_asyncio)
+    monkeypatch.setattr(seminar, "time", SimpleNamespace(time=time.time, monotonic=lambda: clock[0]))
+    return sleeps
+
+
+def test_listen_retries_with_growing_delays_until_it_works(store, sid, fake_clock, monkeypatch):
+    monkeypatch.setattr(seminar, "RETRY_DELAY", 1.5)
+    ai = FakeAI([RuntimeError("503"), RuntimeError("429"), RuntimeError("503"), heard("salom", speaker="new")])
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return ws
 
     ws = asyncio.run(main())
-    assert len(ai.listen_calls) == 2 and ws.of("error") == []
+    assert len(ai.listen_calls) == 4 and fake_clock == [1.5, 3.0, 6.0] and ws.of("error") == []
+    assert ws.of("heard")[0]["id"] == 1
     assert [u["source"] for u in store.units(sid)] == ["salom"]
 
 
-def test_listen_fails_twice_reports_error_and_keeps_going(store, sid):
-    ai = FakeAI([RuntimeError("503"), RuntimeError("503 again"), heard("keyingi", speaker="new")])
+def test_listen_gives_up_after_about_a_minute_and_keeps_going(store, sid, fake_clock, monkeypatch):
+    monkeypatch.setattr(seminar, "RETRY_DELAY", 1.5)
+    ai = FakeAI([RuntimeError("503")] * 6 + [heard("keyingi", speaker="new")])
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(7, make_wav(2.0), T0)
-        await sess.add_audio(8, make_wav(2.0), T0 + 3)
+        await sess.add_audio(7, make_wav(2.0), T0, origin=ws)
+        await sess.add_audio(8, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
         return ws
 
     ws = asyncio.run(main())
+    # 1.5 + 3 + 6 + 12 + 24 = 46.5 s of waiting; another 48 s would pass the 60 s budget
+    assert fake_clock == [1.5, 3.0, 6.0, 12.0, 24.0]
     assert ws.of("error") == [{"type": "error", "id": 7, "message": "Eshitib bo'lmadi"}]
     assert [h["id"] for h in ws.of("heard")] == [8]
     assert [u["source"] for u in store.units(sid)] == ["keyingi"]
+
+
+def test_listen_stops_retrying_when_the_queue_behind_is_full(store, sid, fake_clock, monkeypatch):
+    monkeypatch.setattr(seminar, "MAX_QUEUED_SEGMENTS", 1)
+    ai = FakeAI([RuntimeError("503"), heard("keyingi", speaker="new")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
+        await drain(sess)
+        sess.close()
+        return ws
+
+    ws = asyncio.run(main())
+    assert fake_clock == [] and len(ai.listen_calls) == 2  # newer speech goes first
+    assert ws.of("error") == [{"type": "error", "id": 1, "message": "Eshitib bo'lmadi"}]
+    assert [h["id"] for h in ws.of("heard")] == [2]
 
 
 def test_interpret_retries_once_then_succeeds(store, sid):
@@ -1052,7 +1111,7 @@ def test_interpret_retries_once_then_succeeds(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess
@@ -1061,7 +1120,7 @@ def test_interpret_retries_once_then_succeeds(store, sid):
     assert len(ai.interpret_calls) == 2
     (u,) = store.units(sid)
     assert (u["translation"], u["note"]) == ("Salom!", "izoh")
-    assert list(sess.recent_units) == ["[Spiker 1] Salom!"]
+    assert sess.recent_interpretation() == ["[Spiker 1] Salom!"]
 
 
 def test_interpret_failing_twice_keeps_original_words(store, sid):
@@ -1070,10 +1129,10 @@ def test_interpret_failing_twice_keeps_original_words(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         recent = list(sess.recent_units)
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws, recent
@@ -1103,9 +1162,9 @@ def test_failure_to_save_unit_keeps_segments_for_recovery(store, sid, monkeypatc
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -1128,7 +1187,7 @@ def test_restart_resumes_pending_thought_and_state(store, sid, monkeypatch):
 
     async def first_run():
         sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
         sess.close()  # the server stops before the thought is complete
 
@@ -1140,7 +1199,8 @@ def test_restart_resumes_pending_thought_and_state(store, sid, monkeypatch):
         sess, ws = start(store, sid, ai, FakeVoiceprints([]))
         assert [p["text"] for p in sess.pending] == ["Gapimni tugatmadim"] and sess.busy()
         assert sess.idle_timer is not None
-        assert list(sess.recent_units) == ["[Aziz] Oldingi gap."]
+        assert sess.recent_interpretation() == ["[Aziz] Oldingi gap."]
+        assert sess.recent_transcript() == ["[S1 Aziz] Gapimni tugatmadim"]  # rebuilt from the stored phrases
         s1 = sess.speakers["S1"]
         assert (s1["label"], s1["samples"]) == ("Aziz", 6)
         np.testing.assert_allclose(s1["centroid"], (E1 * 5 + emb) / 6, rtol=1e-5)
@@ -1164,7 +1224,7 @@ def test_restart_pending_thought_continues_with_new_phrase(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0 + 3)
+        await sess.add_audio(1, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -1183,8 +1243,8 @@ def test_restart_with_thoughts_of_two_speakers_keeps_them_apart(store, sid, monk
     async def first_run():
         sess, ws = start(store, sid, ai, None)
         try:
-            await sess.add_audio(1, make_wav(2.0), T0)
-            await sess.add_audio(2, make_wav(2.0), T0 + 3)
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+            await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
             await wait_for(lambda: sess.interpreting == 1 and len(sess.pending) == 1 and sess.working == 1)
             sess.close()  # the server restarts while S1's thought is being interpreted
             await asyncio.sleep(0)
@@ -1235,7 +1295,7 @@ def test_merge_speakers_combines_voiceprints_and_relabels(store, sid):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
         await sess.merge_speakers("S2", "S1")
         await sess.merge_speakers("S1", "S3")  # target without a voiceprint takes the source's
@@ -1279,7 +1339,7 @@ def test_new_speaker_id_after_merge_does_not_collide(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         await sess.merge_speakers("S2", "S1")
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
         sess.close()
         return sess
@@ -1298,7 +1358,7 @@ def test_merge_while_thought_is_being_interpreted(store, sid):
     async def main():
         sess, ws = start(store, sid, ai, None)
         try:
-            await sess.add_audio(1, make_wav(2.0), T0)
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
             await wait_for(lambda: sess.interpreting == 1)
             await sess.merge_speakers("S2", "S1")
         finally:
@@ -1323,7 +1383,7 @@ def test_notes_first_early_then_every_n_units(store, sid, monkeypatch):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i in range(6):
-            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
             await drain(sess)
             calls_after.append(len(ai.notes_calls))
         sess.close()
@@ -1334,7 +1394,7 @@ def test_notes_first_early_then_every_n_units(store, sid, monkeypatch):
     assert calls_after == [0, 1, 1, 1, 2, 2]
     expected = {"summary": "Seminar haqida", "glossary": [{"term": "AI", "translation": "SI", "note": ""}]}
     assert ai.notes_calls[0] == {"notes": {}, "lines": ["[Aziz] a => T:a", "[Aziz] b => T:b"],
-                                 "speakers": ["S1 = Aziz"]}
+                                 "speakers": ["Aziz"]}  # labels only: ids must not reach the summary
     assert ai.notes_calls[1]["notes"] == expected
     assert ai.notes_calls[1]["lines"] == [f"[Aziz] {t} => T:{t}" for t in texts[:5]]  # last 2 * NOTES_EVERY_UNITS
     assert sess.notes == expected and store.session(sid)["notes"] == expected
@@ -1352,7 +1412,7 @@ def test_notes_without_summary_keep_the_early_cadence(store, sid, monkeypatch):
     async def main():
         sess, ws = start(store, sid, ai, None)
         for i in range(2):
-            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
             await drain(sess)
         sess.close()
 
@@ -1370,7 +1430,7 @@ def test_notes_update_not_started_twice(store, sid, monkeypatch):
         sess, ws = start(store, sid, ai, None)
         try:
             for i in range(3):
-                await sess.add_audio(i, make_wav(2.0), T0 + 3 * i)
+                await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
             await wait_for(lambda: len(store.units(sid)) == 3 and sess.working == 0 and ai.notes_calls)
             first_task = sess.notes_task
             await asyncio.sleep(0.05)  # room for a (wrong) second update to show up
@@ -1378,7 +1438,7 @@ def test_notes_update_not_started_twice(store, sid, monkeypatch):
         finally:
             ai.notes_gate.set()
         await sess.notes_task
-        await sess.add_audio(3, make_wav(2.0), T0 + 9)
+        await sess.add_audio(3, make_wav(2.0), T0 + 9, origin=ws)
         await drain(sess)
         sess.close()
 
@@ -1395,9 +1455,9 @@ def test_notes_failure_is_contained(store, sid, monkeypatch):
 
     async def main():
         sess, ws = start(store, sid, ai, None)
-        await sess.add_audio(1, make_wav(2.0), T0)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
         await drain(sess)
-        await sess.add_audio(2, make_wav(2.0), T0 + 3)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
         await drain(sess)
         sess.close()
         return sess, ws
@@ -1422,7 +1482,7 @@ def test_busy_tracks_queued_in_flight_and_pending_work(store, sid):
         sess, ws = start(store, sid, ai, None)
         try:
             states["idle"] = sess.busy()
-            await sess.add_audio(1, make_wav(2.0), T0)
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
             states["queued"] = sess.busy()
             await asyncio.to_thread(listen_entered.wait, 5)
             states["listening"] = (sess.busy(), sess.working, sess.listen_queue.empty())
@@ -1478,6 +1538,555 @@ def test_close_cancels_workers_and_idle_timer(store, sid):
 
     sess, timer = asyncio.run(main())
     assert timer.cancelled() and all(t.cancelled() for t in sess.workers)
+
+
+# ---------------------------------------------------------------- store: ids, merges, notes position
+
+
+def test_store_ids_are_never_reused(store, sid):
+    """Late background work of a deleted session or report must not land in a new one."""
+    seg = store.add_segment(sid, {"start": 0, "end": 1, "speaker": "S1", "lang": "uz", "text": "x", "complete": True})
+    (unit,) = _units(store, sid, [(0.0, 1.0)])
+    report = store.start_report(sid, 0.0, 1.0)
+    store.delete_session(sid)
+    again = store.create_session("Yangi")["id"]
+    assert again > sid
+    assert store.add_segment(again, {"start": 0, "end": 1, "speaker": "S1", "lang": "uz", "text": "y",
+                                     "complete": True}) > seg
+    assert _units(store, again, [(0.0, 1.0)])[0] > unit
+    assert store.start_report(again, 0.0, 1.0) > report
+    store.finish_report(report, {"title": "eski"})  # the deleted session's job finishing late
+    assert [r["status"] for r in store.reports(again)] == ["pending"]
+
+
+def test_store_merge_map_and_labels_of_merged_ids(store, sid):
+    seed_speaker(store, sid, "S1", label="Aziz")
+    seed_speaker(store, sid, "S2")
+    seed_speaker(store, sid, "S3")
+    store.merge_speakers(sid, "S2", "S3")
+    store.merge_speakers(sid, "S3", "S1")  # S2 follows S3 into S1
+    assert store.session(sid)["merged"] == {"S2": "S1", "S3": "S1"}
+    # a report written before the merges still names S2 and S3: they read as the person they became
+    assert store.speaker_labels(sid) == {"S1": "Aziz", "S2": "Aziz", "S3": "Aziz"}
+    assert store.speaker_labels(12345) == {}
+
+
+def test_merged_ids_are_never_reissued_after_a_reload(store, sid):
+    seed_speaker(store, sid, "S1")
+    seed_speaker(store, sid, "S2")
+    ai = FakeAI([heard("yangi odam", speaker="new")])
+
+    async def first():
+        sess, ws = start(store, sid, FakeAI(), None)
+        await sess.merge_speakers("S2", "S1")
+        sess.close()
+
+    async def second():
+        sess, ws = start(store, sid, ai, None)
+        assert sess.merged == {"S2": "S1"}
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    asyncio.run(first())
+    sess = asyncio.run(second())
+    assert list(sess.speakers) == ["S1", "S3"]  # not S2 again: older reports mean someone else by it
+
+
+def test_notes_keep_their_cadence_across_reloads(store, sid, monkeypatch):
+    """A device reconnecting every few minutes reloads the session; the notes must still be updated."""
+    monkeypatch.setattr(seminar, "NOTES_FIRST_AFTER_UNITS", 3)
+    seed_speaker(store, sid, "S1")
+    ai = FakeAI([heard(f"p{i}", speaker="S1") for i in range(4)])
+
+    async def run(i):
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
+        await drain(sess)
+        sess.close()
+
+    for i in range(3):
+        asyncio.run(run(i))
+    assert len(ai.notes_calls) == 1  # the third unit, although each session saw only one
+    assert store.session(sid)["notes_unit"] == max(u["id"] for u in store.units(sid))
+    asyncio.run(run(3))
+    assert len(ai.notes_calls) == 1  # counting starts again from what the notes cover
+
+
+# ---------------------------------------------------------------- replies, dedupe, echo
+
+
+def test_answers_about_a_phrase_go_only_to_its_sender(store, sid, monkeypatch):
+    ai = FakeAI([heard("Salom", speaker="new"), heard(""), RuntimeError("503")])
+
+    async def main():
+        sess, sender = start(store, sid, ai, None)
+        other = FakeWS()
+        sess.join(other)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=sender)
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=sender)
+        await drain(sess)
+        monkeypatch.setattr(seminar, "LISTEN_RETRY_SECONDS", 0)  # give up at once
+        await sess.add_audio(3, make_wav(2.0), T0 + 6, origin=sender)
+        await drain(sess)
+        sess.close()
+        return sender, other
+
+    sender, other = asyncio.run(main())
+    assert [(m["type"], m["id"]) for m in sender.messages if "id" in m] == [("heard", 1), ("empty", 2), ("error", 3)]
+    assert not [m for m in other.messages if m["type"] in ("heard", "empty", "error")]
+    assert {"speaker", "unit", "pending"} <= set(other.types())  # the rest is for every device
+
+
+def test_resent_phrases_are_recognised_for_a_while(store, sid, fake_clock):
+    async def main():
+        sess, ws = start(store, sid, FakeAI([heard("")] * 3), None)
+        assert not sess.received_before("abc", 1)
+        await sess.add_audio(1, make_wav(1.0), T0, origin=ws, client="abc")
+        await sess.add_audio(1, make_wav(1.0), T0, origin=ws, client="")  # no client id: no dedupe
+        result = [sess.received_before("abc", 1), sess.received_before("abc", 2), sess.received_before("xyz", 1),
+                  sess.received_before("", 1)]
+        await seminar.asyncio.sleep(seminar.DEDUPE_SECONDS + 1)
+        result.append(sess.received_before("abc", 1))
+        await drain(sess)
+        sess.close()
+        return result, sess
+
+    result, sess = asyncio.run(main())
+    assert result == [True, False, False, False, False]
+    assert not sess.received  # forgotten, not kept all day
+
+
+def test_read_out_picked_up_by_a_microphone_is_dropped(store, sid, monkeypatch):
+    """A device reading the translation aloud near another device's microphone must not start a loop."""
+    ai = FakeAI(
+        [heard("Здравствуйте, коллеги. Начнём семинар.", speaker="new", lang="ru"),
+         heard("Assalomu alaykum hamkasblar, seminarni boshlaymiz", speaker="new"),  # the whole read-out
+         heard("Seminarni boshlaymiz!", speaker="new"),  # one sentence of it
+         heard("Rahmat, savolim bor.", speaker="new")],  # real speech
+        interpret=[Rendered(translation="Assalomu alaykum, hamkasblar. Seminarni boshlaymiz.", note="")],
+    )
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        for i in range(4):
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
+            await drain(sess)
+        sess.close()
+        return sess, ws
+
+    sess, ws = asyncio.run(main())
+    assert [m["id"] for m in ws.of("empty")] == [1, 2]
+    assert [u["source"] for u in store.units(sid)] == ["Здравствуйте, коллеги. Начнём семинар.", "Rahmat, savolim bor."]
+    assert list(sess.speakers) == ["S1", "S2"]
+
+
+def test_echo_window_expires(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "ECHO_SECONDS", 0.0)
+    ai = FakeAI([heard("Hello", speaker="new", lang="en"), heard("T:Hello", speaker="new")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        for i in range(2):
+            await sess.add_audio(i, make_wav(2.0), T0 + 3 * i, origin=ws)
+            await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert len(store.units(sid)) == 2
+
+
+# ---------------------------------------------------------------- the idle flush and explicit flush
+
+
+def test_idle_flush_waits_while_a_device_hears_speech(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 0.05)
+    ai = FakeAI([heard("Asosiy muammo shundaki,", speaker="new", complete=False)])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        sess.set_speaking(ws, True)  # the speaker goes on without a pause
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+        await asyncio.sleep(0.2)
+        held = (len(sess.pending), store.units(sid), sess.idle_timer is not None)
+        sess.set_speaking(ws, False)  # the pause starts now
+        stopped = time.monotonic()
+        await wait_for(lambda: len(store.units(sid)) == 1)
+        waited = time.monotonic() - stopped
+        sess.close()
+        return held, waited
+
+    held, waited = asyncio.run(main())
+    assert held == (1, [], True)
+    assert waited >= 0.04
+
+
+def test_a_device_that_leaves_counts_as_silent(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 0.05)
+    ai = FakeAI([heard("Gap", speaker="new", complete=False)])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        other = FakeWS()
+        sess.join(other)
+        sess.set_speaking(other, True)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+        await asyncio.sleep(0.15)
+        held = store.units(sid) == []
+        sess.leave(other)
+        await wait_for(lambda: len(store.units(sid)) == 1)
+        sess.close()
+        return held, sess
+
+    held, sess = asyncio.run(main())
+    assert held and sess.speaking == set() and len(sess.clients) == 1
+
+
+def test_speech_start_and_stop_without_pending_thought_do_nothing(store, sid):
+    async def main():
+        sess, ws = start(store, sid, FakeAI(), None)
+        sess.set_speaking(ws, True)
+        sess.set_speaking(ws, False)
+        sess.leave(ws)
+        timer = sess.idle_timer
+        sess.close()
+        return timer
+
+    assert asyncio.run(main()) is None
+
+
+def test_requested_flush_waits_for_the_phrases_already_sent(store, sid):
+    """Stop is pressed while the last phrase is still being transcribed: it belongs to the same thought."""
+    gate, entered = threading.Event(), threading.Event()
+    ai = FakeAI([heard("Xulosa qilib", speaker="new", complete=False),
+                 gated(heard("aytganda", speaker="S1", complete=False), gate, entered),
+                 heard("keyingi", speaker="S1", complete=False)])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        try:
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+            await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+            await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
+            await asyncio.to_thread(entered.wait, 5)
+            sess.request_flush()
+            await asyncio.sleep(0.05)
+            assert store.units(sid) == [] and sess.unit_queue.empty() and sess.flush_requested
+        finally:
+            gate.set()
+        await drain(sess)
+        units = [u["source"] for u in store.units(sid)]
+        # the request is used up: later phrases wait for their own end of thought
+        await sess.add_audio(3, make_wav(2.0), T0 + 6, origin=ws)
+        await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+        sess.close()
+        return units, sess
+
+    units, sess = asyncio.run(main())
+    assert units == ["Xulosa qilib aytganda"]
+    assert not sess.flush_requested and [p["text"] for p in sess.pending] == ["keyingi"]
+
+
+def test_requested_flush_with_nothing_queued_is_immediate(store, sid):
+    ai = FakeAI([heard("Gap", speaker="new", complete=False)])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+        sess.request_flush()
+        assert sess.pending == [] and sess.unit_queue.qsize() == 1
+        await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert [u["source"] for u in store.units(sid)] == ["Gap"]
+
+
+# ---------------------------------------------------------------- speaker rules
+
+
+def test_short_clip_never_makes_a_new_speaker_by_voice_alone(store, sid):
+    """Short replies of a known person often score low against their voiceprint."""
+    seed_speaker(store, sid, "S1", centroid=E1, samples=4)
+    seed_speaker(store, sid, "S2", centroid=E2, samples=4)
+    ai = FakeAI([heard("Rahmat", speaker="S1")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([toward(E3, E4, 0.9)]))
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess, ws
+
+    sess, ws = asyncio.run(main())
+    assert ws.of("heard")[0]["speaker"] == "S1" and list(sess.speakers) == ["S1", "S2"]
+    assert ai.listen_calls[0]["references"] and ai.listen_calls[0]["identified"] is None
+    assert sess.speakers["S1"]["samples"] == 4  # an unlike voice teaches the voiceprint nothing
+
+
+def test_long_clip_unlike_everyone_but_not_clearly_follows_gemini(store, sid):
+    seed_speaker(store, sid, "S1", centroid=E1, samples=4)
+    ai = FakeAI([heard("Davom etamiz", speaker="S1"), heard("Men boshqa odamman", speaker="new")])
+    embs = [toward(E1, E2, 0.25), toward(E1, E3, 0.25)]
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints(embs))
+        for i in range(2):
+            await sess.add_audio(i, make_wav(4.0), T0 + 5 * i, origin=ws)
+            await drain(sess)
+        sess.close()
+        return sess, ws
+
+    sess, ws = asyncio.run(main())
+    assert [h["speaker"] for h in ws.of("heard")] == ["S1", "S2"]
+    assert sess.speakers["S1"]["samples"] == 4  # followed, but too unlike to learn from
+
+
+def test_voiceprint_decision_is_told_to_gemini(store, sid):
+    seed_speaker(store, sid, "S1", label="Aziz", centroid=E1, samples=2)
+    ai = FakeAI([heard("Davom etamiz", speaker="S1"), heard("Yangi odam", speaker="new")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([E1, E3]))
+        for i in range(2):
+            await sess.add_audio(i, make_wav(3.0), T0 + 5 * i, origin=ws)
+            await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert [c["identified"] for c in ai.listen_calls] == ["S1", "new"]
+    assert [c["references"] for c in ai.listen_calls] == [[], []]
+
+
+def test_seminar_ai_listen_tells_gemini_what_the_voiceprints_decided():
+    interp = FakeInterpreter(heard("x"))
+    ai = SeminarAI(interp)
+    ai.listen(b"RIFF", [], {"S1": 0.9}, [], {}, identified="S1")
+    ai.listen(b"RIFF", [], {"S1": 0.1}, [], {}, identified="new")
+    assert 'identified this speaker as S1: answer "S1"' in interp.calls[0]["system"]
+    assert 'someone not heard before: answer "new"' in interp.calls[1]["system"]
+    assert "Voiceprint similarity" not in interp.calls[0]["system"]
+
+
+@pytest.mark.parametrize(
+    "emb, gemini, name, expected_label",
+    [
+        (E1, "S1", "Prof. Karimov", "Prof. Karimov"),  # Gemini meant the person the voiceprint chose
+        (E1, "new", "Prof. Karimov", "Spiker 1"),  # the moderator handing over the floor: a name for someone else
+        (E1, "S2", "Prof. Karimov", "Spiker 1"),
+    ],
+    ids=["agrees", "gemini-says-new", "gemini-names-another"],
+)
+def test_speaker_name_only_for_the_person_gemini_meant(store, sid, emb, gemini, name, expected_label):
+    seed_speaker(store, sid, "S1", centroid=E1, samples=3)
+    seed_speaker(store, sid, "S2", centroid=E2, samples=3)
+    ai = FakeAI([heard("So'zni professorga beraman", speaker=gemini, name=name)])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([emb]))
+        await sess.add_audio(1, make_wav(3.0), T0, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    sess = asyncio.run(main())
+    assert list(sess.speakers) == ["S1", "S2"] and sess.speakers["S1"]["label"] == expected_label
+
+
+def test_voiceprint_new_speaker_does_not_take_the_name_gemini_gave_someone_else(store, sid):
+    seed_speaker(store, sid, "S1", label="Spiker 1", centroid=E1, samples=3)
+    ai = FakeAI([heard("Savolim bor", speaker="S1", name="Aziz")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([E3]))
+        await sess.add_audio(1, make_wav(3.0), T0, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    sess = asyncio.run(main())
+    assert [(sp["id"], sp["label"], sp["named"]) for sp in sess.speakers.values()] == [
+        ("S1", "Spiker 1", False), ("S2", "Spiker 2", False)]
+
+
+def test_voiceprints_learn_only_from_clips_of_two_seconds_or_more(store, sid):
+    seed_speaker(store, sid, "S1", centroid=E1, samples=1)
+    ai = FakeAI([heard("Ha", speaker="S1"), heard("Yo'q", speaker="new"), heard("Ha, albatta", speaker="S1")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([E1, E3, E1]))
+        await sess.add_audio(1, make_wav(1.5), T0, origin=ws)
+        await sess.add_audio(2, make_wav(1.5), T0 + 3, origin=ws)
+        await sess.add_audio(3, make_wav(2.0), T0 + 6, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    sess = asyncio.run(main())
+    assert sess.speakers["S1"]["samples"] == 2  # only the 2 s clip
+    assert sess.speakers["S2"]["centroid"] is None and sess.speakers["S2"]["samples"] == 0
+
+
+def test_new_speaker_reference_is_cut_to_a_good_length(store, sid):
+    ai = FakeAI([heard("Uzun gap", speaker="new")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(1, make_wav(12.0), T0, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    sess = asyncio.run(main())
+    s1 = sess.speakers["S1"]
+    assert s1["ref_seconds"] == seminar.GOOD_REFERENCE_SECONDS[1]
+    assert seminar.wav_seconds(s1["ref_wav"]) == pytest.approx(seminar.GOOD_REFERENCE_SECONDS[1])
+    assert store.units(sid)[0]["start"] == pytest.approx(T0 - 12.0)  # the phrase itself is whole
+
+
+def test_trim_wav_keeps_short_or_unreadable_clips():
+    wav = make_wav(2.0)
+    assert seminar.trim_wav(wav, 8.0) is wav
+    assert seminar.trim_wav(b"RIFF....junk", 1.0) == b"RIFF....junk"
+    assert seminar.wav_seconds(seminar.trim_wav(wav, 0.5)) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("voiceprints", [True, False], ids=["voiceprint-disagrees", "no-voiceprints"])
+def test_reference_and_voice_change_only_on_confident_attribution(store, sid, voiceprints):
+    seed_speaker(store, sid, "S1", centroid=E1 if voiceprints else None, ref_wav=b"R1", ref_seconds=1.5)
+    seed_speaker(store, sid, "S2", centroid=E2 if voiceprints else None, ref_wav=b"R2", ref_seconds=1.5)
+    wav = make_wav(5.0)
+    ai = FakeAI([heard("Boshqa odamning gapi", speaker="S2", voice="ayol ovozi")])
+    vp = FakeVoiceprints([toward(E1, E3, 0.5)]) if voiceprints else None
+
+    async def main():
+        sess, ws = start(store, sid, ai, vp)
+        await sess.add_audio(1, wav, T0, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    sess = asyncio.run(main())
+    s2 = sess.speakers["S2"]
+    assert (s2["ref_wav"], s2["voice"]) == (b"R2", "")  # Gemini's pick wasn't confirmed by anything
+
+
+def test_gemini_answer_with_a_merged_away_id_follows_the_merge(store, sid):
+    seed_speaker(store, sid, "S1")
+    seed_speaker(store, sid, "S2")
+    ai = FakeAI([heard("birinchi", speaker="S2"), heard("ikkinchi", speaker="S2")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await drain(sess)
+        await sess.merge_speakers("S2", "S1")
+        recent = sess.recent_transcript()
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess, ws, recent
+
+    sess, ws, recent = asyncio.run(main())
+    assert recent == ["[S1 Spiker 1] birinchi"]  # Gemini's context shows the merge at once
+    assert list(sess.speakers) == ["S1"] and [h["speaker"] for h in ws.of("heard")] == ["S2", "S1"]
+
+
+def test_merge_while_a_phrase_is_being_heard(store, sid):
+    """The voiceprint matched S2 before the merge: no crash, no second Gemini call, S1 it is."""
+    seed_speaker(store, sid, "S1", centroid=E1, samples=1)
+    seed_speaker(store, sid, "S2", centroid=E2, samples=1)
+    gate, entered = threading.Event(), threading.Event()
+    ai = FakeAI([gated(heard("gap", speaker="S2"), gate, entered)])
+
+    async def main():
+        sess, ws = start(store, sid, ai, FakeVoiceprints([E2]))
+        try:
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+            await asyncio.to_thread(entered.wait, 5)
+            await sess.merge_speakers("S2", "S1")
+        finally:
+            gate.set()
+        await drain(sess)
+        sess.close()
+        return sess, ws
+
+    sess, ws = asyncio.run(main())
+    assert len(ai.listen_calls) == 1 and ws.of("heard")[0]["speaker"] == "S1"
+    assert list(sess.speakers) == ["S1"] and [p["speaker"] for p in sess.pending + store.units(sid)] == ["S1"]
+
+
+def test_recent_lines_show_current_labels(store, sid):
+    seed_speaker(store, sid, "S1")
+    ai = FakeAI([heard("salom", speaker="S1"), heard("davom", speaker="S1")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await drain(sess)
+        await sess.rename_speaker("S1", "Aziz")
+        await sess.add_audio(2, make_wav(2.0), T0 + 3, origin=ws)
+        await drain(sess)
+        sess.close()
+        return sess
+
+    sess = asyncio.run(main())
+    assert ai.listen_calls[1]["recent"] == ["[S1 Aziz] salom"]
+    assert ai.interpret_calls[1]["recent"] == ["[Aziz] T:salom"]
+
+
+def test_references_rank_by_similarity_then_recency_and_keep_recent_speakers(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "MAX_REFERENCE_SPEAKERS", 3)
+    for i in range(1, 8):  # Gemini-only: no similarities at all
+        seed_speaker(store, sid, f"S{i}", ref_wav=f"R{i}".encode())
+    # S1 spoke last in the recent transcript but long ago; S7 and S5 spoke most recently
+    for spk, end in (("S1", T0 - 600), ("S3", T0 - 500), ("S5", T0 - 20), ("S7", T0 - 10)):
+        store.add_segment(sid, {"start": end - 2, "end": end, "speaker": spk, "lang": "uz", "text": spk,
+                                "complete": True})
+    with closing(store._connect()) as db, db:  # S1's line is the newest in the transcript, S3 is older
+        db.execute("UPDATE segments SET id = id + 100 WHERE speaker = 'S1'")
+    monkeypatch.setattr(seminar, "RECENT_LINES", 1)
+    ai = FakeAI([heard("x", speaker="S7")])
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+        await drain(sess)
+        sess.close()
+
+    asyncio.run(main())
+    assert ai.listen_calls[0]["recent"] == ["[S1 Spiker 1] S1"]
+    assert ai.listen_calls[0]["references"] == ["S7", "S5", "S1"]
+
+
+def test_close_stops_everything_and_unload_checks(store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "NOTES_FIRST_AFTER_UNITS", 1)
+    seed_speaker(store, sid, "S1")
+    store.add_segment(sid, {"start": 0, "end": 1, "speaker": "S1", "lang": "uz", "text": "x", "complete": False})
+    ai = FakeAI([heard("a", speaker="S1", complete=False)])
+    ai.notes_gate = threading.Event()
+
+    async def main():
+        sess, ws = start(store, sid, ai, None)
+        try:
+            sess.flush()
+            await wait_for(lambda: sess.notes_task is not None)
+            task = sess.notes_task
+            await sess.add_audio(1, make_wav(2.0), T0, origin=ws)
+            await wait_for(lambda: len(sess.pending) == 1 and sess.working == 0)
+            sess.close()
+            sess.set_speaking(ws, False)  # a late message after the close arms nothing
+            await asyncio.sleep(0)
+            return sess, task
+        finally:
+            ai.notes_gate.set()
+
+    sess, task = asyncio.run(main())
+    assert sess.closed and sess.idle_timer is None and task.cancelled()
 
 
 # ---------------------------------------------------------------- build_report

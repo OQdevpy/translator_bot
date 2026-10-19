@@ -36,7 +36,8 @@
 
 * { box-sizing: border-box; }
 
-html, body { height: 100%; }
+/* no pull-to-refresh: a reload would silently end the recording */
+html, body { height: 100%; overscroll-behavior: none; }
 
 body {
   margin: 0;
@@ -99,6 +100,7 @@ select {
 .transcript {
   flex: 1;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 16px;
   display: flex;
   flex-direction: column;
@@ -148,19 +150,27 @@ select {
 
 .live {
   display: flex;
-  align-items: baseline;
+  align-items: flex-end;
   gap: 8px;
   padding: 8px 16px;
   border-top: 1px dashed var(--border);
   background: var(--panel);
   font-size: 0.92rem;
   color: var(--muted);
-  max-height: 4.6em;
-  overflow: hidden;
 }
 
-.live-text { flex: 1; overflow-wrap: anywhere; }
-.live-text::after { content: " …"; animation: dots 1s steps(3) infinite; }
+/* anchored to its end: when the thought is longer than two lines, the oldest words are cut, not the newest */
+.live-text {
+  flex: 1;
+  min-width: 0;
+  max-height: 2.9em;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+}
+.live-text span::after { content: " …"; animation: dots 1s steps(3) infinite; }
 .live-busy { white-space: nowrap; }
 
 @keyframes dots { 0% { opacity: 0.2; } 50% { opacity: 1; } }
@@ -279,4 +289,5 @@ body.login { align-items: center; justify-content: center; padding: 16px; }
   .settings select { min-width: 0; width: 100%; }
   .settings label { flex: 1 1 140px; }
   .unit .tr { font-size: 1.08rem; }
+  .live-busy .busy-label { display: none; } /* the icon is enough; the words take the live text's room */
 }

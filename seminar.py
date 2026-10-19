@@ -8,14 +8,18 @@ and a terminology list as context. Everything is stored in SQLite, so a seminar 
 run all day, survive reloads and be turned into a report for any time range.
 """
 import asyncio
+import io
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
-from collections import Counter, deque
+import wave
+from collections import Counter, OrderedDict, deque
 from contextlib import closing
 from datetime import datetime
+from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -29,15 +33,31 @@ log = logging.getLogger("stt_web")
 
 KEEP_UZBEK = "uz"  # partner setting: leave Uzbek speech in Uzbek
 SAME_VOICE = 0.62  # voiceprint similarity above which it is surely the same person
-NEW_VOICE = 0.45  # below this for every known speaker it is surely someone new
+NEW_VOICE = 0.30  # different people usually score below this (short clips of one person can too)
+SURELY_NEW_VOICE = 0.20  # below this for everyone, on a long clip, it is surely someone new
+NEW_VOICE_MIN_SECONDS = 3.0  # shorter clips score too low too often to declare someone new by voice
+CENTROID_MIN_SECONDS = 2.0  # shorter clips make noisy voiceprints
+REFERENCE_MIN_SECONDS = 1.0  # a speaker known only from a shorter clip can't be compared by voice
+UNKNOWN_VOICE_SILENT_SECONDS = 30 * 60  # a speaker without a voiceprint silent this long is not expected back
 MAX_REFERENCE_SPEAKERS = 6  # reference recordings sent to Gemini with each phrase
 GOOD_REFERENCE_SECONDS = (4.0, 8.0)
 UNIT_MAX_SECONDS = 25.0  # interpret even if the speaker hasn't finished the thought by then
-IDLE_FLUSH_SECONDS = 4.0  # ...or after this long without new speech
+IDLE_FLUSH_SECONDS = 4.0  # ...or after this long without speech
 NOTES_FIRST_AFTER_UNITS = 4  # early notes help with names and terms from the start
 NOTES_EVERY_UNITS = 12
 RECENT_UNITS = 8
-RETRY_DELAY = 1.5  # seconds before the one retry of a failed Gemini call
+RECENT_LINES = 8
+RETRY_DELAY = 1.5  # seconds before retrying a failed Gemini call (doubles for listening)
+LISTEN_RETRY_SECONDS = 60.0  # a phrase is retried this long (an outage, a rate limit) before it is given up
+MAX_QUEUED_SEGMENTS = 20  # per session; protects the API budget from a runaway client
+DEDUPE_SECONDS = 15 * 60  # a phrase resent after a reconnect is recognised for this long
+ECHO_SECONDS = 90.0  # a phrase that matches a translation this recent is its read-out picked up by a microphone
+ECHO_SIMILARITY = 0.8
+# per-call limits: a stuck call must not hold up the live queue, a long report must be allowed to finish
+LISTEN_TIMEOUT, LISTEN_MAX_TOKENS = 20.0, 2048
+INTERPRET_TIMEOUT, INTERPRET_MAX_TOKENS = 60.0, 2048
+NOTES_TIMEOUT, NOTES_MAX_TOKENS = 60.0, 8192
+REPORT_TIMEOUT, REPORT_MAX_TOKENS = 600.0, 32768
 
 # ---------------------------------------------------------------- prompts
 
@@ -46,19 +66,19 @@ You get reference recordings of the speakers identified so far, then a NEW SEGME
 
 1. text: transcribe the NEW SEGMENT verbatim in its original language and script (Uzbek in Latin script).
    Empty if there is no intelligible speech (silence, noise, music, applause, coughing).
-2. speaker: who speaks in the NEW SEGMENT. Compare the voice (timbre, pitch, gender, accent, manner)
+2. source_lang: ISO 639-1 code of the language spoken.
+3. complete: true if the segment ends at the end of a sentence or complete thought; false if the
+   speaker stopped mid-sentence and will clearly continue.
+4. voice: a few words describing the voice (e.g. "deep male voice, slow").
+5. speaker_name: the name or title of the person speaking in the NEW SEGMENT, only if it is clear: they
+   introduce themselves, or right before this segment someone else handed the floor to them or addressed
+   them by name. Never the name of the person they address or hand the floor to, nor of anyone they
+   merely mention; otherwise empty.
+6. speaker: who speaks in the NEW SEGMENT. Compare the voice (timbre, pitch, gender, accent, manner)
    with the reference recordings and use the context: who was given the floor, who is answering whom.
    Return a known id, or "new" if it is a person not among the references.
    Language does not decide identity: people switch languages.
-   Voiceprint similarity (same person is usually 0.62 or more, different people 0.45 or less):
-{similarities}
-3. speaker_name: the speaker's own name or title if it becomes clear who this is (they introduce
-   themselves, the floor was just handed to someone by name, or someone addresses them by name);
-   otherwise empty. Never the name of someone they merely mention.
-4. voice: a few words describing the voice (e.g. "deep male voice, slow").
-5. source_lang: ISO 639-1 code of the language spoken.
-6. complete: true if the segment ends at the end of a sentence or complete thought; false if the
-   speaker stopped mid-sentence and will clearly continue.
+{voices}
 
 Terminology (use these spellings for names and terms):
 {notes}
@@ -87,7 +107,8 @@ Recent interpretation (oldest first):
 
 NOTES_PROMPT = """You keep the working notes of an interpreter at a seminar. Update them with the new part.
 - summary: in Uzbek, 3-8 sentences: what the seminar is about, who the speakers are (names, roles),
-  what has been covered so far and what is going on now.
+  what has been covered so far and what is going on now. Refer to people by their name or their label
+  from the speaker list; never use ids like S1.
 - glossary: the important names, organisations, technical terms and abbreviations so far (at most 40),
   each with its established Uzbek rendering and, if useful, a few words of explanation.
   Keep earlier entries unless they were wrong."""
@@ -114,12 +135,13 @@ text refer to people by their name or label from the speaker list. Times are HH:
 
 
 class Heard(BaseModel):
-    speaker: str
-    speaker_name: str
-    voice: str
-    source_lang: str
+    # Gemini writes the fields in this order: the transcript first, identity last, decided with the words in view
     text: str
+    source_lang: str
     complete: bool
+    voice: str
+    speaker_name: str
+    speaker: str
 
 
 class Rendered(BaseModel):
@@ -198,19 +220,32 @@ class SeminarAI:
         self.interpreter = interpreter
         self.report_model = report_model
 
-    def listen(self, wav: bytes, references: list[dict], similarities: dict, recent: list[str], notes: dict) -> Heard:
+    def listen(self, wav: bytes, references: list[dict], similarities: dict, recent: list[str], notes: dict,
+               identified: str | None = None) -> Heard:
+        """identified: the speaker id (or "new") when the voiceprints already settled who speaks."""
         contents = []
         for ref in references:
             contents.append(f"Reference recording of speaker {ref['id']} ({ref['label']}; {ref['voice'] or 'voice not described'}):")
             contents.append(types.Part.from_bytes(data=ref["ref_wav"], mime_type="audio/wav"))
         contents += ["NEW SEGMENT:", types.Part.from_bytes(data=wav, mime_type="audio/wav")]
-        sims = "\n".join(f"   - {sid}: {score:.2f}" for sid, score in similarities.items()) or "   (not available)"
+        if identified == "new":  # told, so that speaker_name is about the right person
+            voices = '   The voiceprints show this is someone not heard before: answer "new".'
+        elif identified:
+            voices = f'   The voiceprints identified this speaker as {identified}: answer "{identified}".'
+        else:
+            voices = (
+                f"   Voiceprint similarity (the same person usually scores {SAME_VOICE:.2f} or more, different people"
+                f" {NEW_VOICE:.2f} or less; short segments score lower):\n"
+                + ("\n".join(f"   - {sid}: {score:.2f}" for sid, score in similarities.items()) or "   (not available)")
+            )
         system = LISTEN_PROMPT.format(
-            similarities=sims,
+            voices=voices,
             notes=notes_text({"glossary": notes.get("glossary")}),
             recent="\n".join(recent) or "(nothing yet)",
         )
-        heard = self.interpreter.generate(contents, system, Heard, temperature=0.1)
+        heard = self.interpreter.generate(
+            contents, system, Heard, timeout=LISTEN_TIMEOUT, max_tokens=LISTEN_MAX_TOKENS
+        )
         heard.text = heard.text.strip()
         heard.source_lang = heard.source_lang.strip().lower()
         heard.speaker = heard.speaker.strip()
@@ -223,47 +258,57 @@ class SeminarAI:
             target=target_name, notes=notes_text(notes), recent="\n".join(recent) or "(nothing yet)"
         )
         source = LANGS[source_lang][2] if source_lang in LANGS else source_lang
-        result = self.interpreter.generate(f"{speaker} ({source}): {text}", system, Rendered)
+        result = self.interpreter.generate(
+            f"{speaker} ({source}): {text}", system, Rendered, timeout=INTERPRET_TIMEOUT, max_tokens=INTERPRET_MAX_TOKENS
+        )
         result.translation = result.translation.strip()
         result.note = result.note.strip()
         return result
 
     def update_notes(self, notes: dict, new_lines: list[str], speakers: list[str]) -> Notes:
+        """speakers: their labels only; ids would end up in the summary, which every device shows."""
         contents = (
             f"Current notes:\n{notes_text(notes)}\n\nSpeakers: {', '.join(speakers)}\n\n"
             "New part of the seminar:\n" + "\n".join(new_lines)
         )
-        return self.interpreter.generate(contents, NOTES_PROMPT, Notes)
+        return self.interpreter.generate(
+            contents, NOTES_PROMPT, Notes, timeout=NOTES_TIMEOUT, max_tokens=NOTES_MAX_TOKENS
+        )
 
     def report(self, transcript: str, speakers: str, period: str) -> Report:
         contents = f"Period: {period}\nSpeakers:\n{speakers}\n\nTranscript:\n{transcript}"
         return self.interpreter.generate(
-            contents, REPORT_PROMPT, Report, thinking="medium", temperature=0.3, model=self.report_model
+            contents, REPORT_PROMPT, Report, thinking="medium", model=self.report_model,
+            timeout=REPORT_TIMEOUT, max_tokens=REPORT_MAX_TOKENS,
         )
 
 
 # ---------------------------------------------------------------- storage
 
+# AUTOINCREMENT: ids are never reused, so late background work of a deleted session or report
+# (or a device still holding its id) can't land in a new one. merged: merged-away speaker id -> the one it
+# became, so those ids are never issued again; notes_unit: the last unit the notes cover.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY, title TEXT NOT NULL, created_at REAL NOT NULL,
-    partner TEXT NOT NULL DEFAULT 'uz', notes TEXT NOT NULL DEFAULT '{}');
+    id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, created_at REAL NOT NULL,
+    partner TEXT NOT NULL DEFAULT 'uz', notes TEXT NOT NULL DEFAULT '{}',
+    merged TEXT NOT NULL DEFAULT '{}', notes_unit INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS speakers (
     session_id INTEGER NOT NULL, id TEXT NOT NULL, label TEXT NOT NULL, named INTEGER NOT NULL DEFAULT 0,
     voice TEXT NOT NULL DEFAULT '', ref_wav BLOB, ref_seconds REAL NOT NULL DEFAULT 0,
     centroid BLOB, samples INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_id, id));
 CREATE TABLE IF NOT EXISTS segments (
-    id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
     speaker TEXT NOT NULL, lang TEXT NOT NULL, text TEXT NOT NULL, complete INTEGER NOT NULL,
     embedding BLOB, unit_id INTEGER);
 CREATE INDEX IF NOT EXISTS segments_session ON segments (session_id, unit_id);
 CREATE TABLE IF NOT EXISTS units (
-    id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, start REAL NOT NULL, end REAL NOT NULL,
     speaker TEXT NOT NULL, lang TEXT NOT NULL, target TEXT NOT NULL, source TEXT NOT NULL,
     translation TEXT NOT NULL, note TEXT NOT NULL DEFAULT '');
 CREATE INDEX IF NOT EXISTS units_session ON units (session_id, start);
 CREATE TABLE IF NOT EXISTS reports (
-    id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL, created_at REAL NOT NULL,
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, created_at REAL NOT NULL,
     start REAL NOT NULL, end REAL NOT NULL, report TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'done', error TEXT NOT NULL DEFAULT '');
 """
@@ -318,6 +363,7 @@ class SeminarStore:
             return None
         row = rows[0]
         row["notes"] = json.loads(row["notes"])
+        row["merged"] = json.loads(row["merged"])
         return row
 
     def sessions(self) -> list[dict]:
@@ -328,8 +374,9 @@ class SeminarStore:
         )
 
     def update_session(self, session_id: int, **fields):
-        if "notes" in fields:
-            fields["notes"] = json.dumps(fields["notes"], ensure_ascii=False)
+        for key in ("notes", "merged"):
+            if key in fields:
+                fields[key] = json.dumps(fields[key], ensure_ascii=False)
         sets = ", ".join(f"{k} = ?" for k in fields)
         self._write(f"UPDATE sessions SET {sets} WHERE id = ?", (*fields.values(), session_id))
 
@@ -361,6 +408,24 @@ class SeminarStore:
             for table in ("segments", "units"):
                 db.execute(f"UPDATE {table} SET speaker = ? WHERE session_id = ? AND speaker = ?", (target, session_id, source))
             db.execute("DELETE FROM speakers WHERE session_id = ? AND id = ?", (session_id, source))
+            (merged,) = db.execute("SELECT merged FROM sessions WHERE id = ?", (session_id,)).fetchone()
+            merged = {old: target if new == source else new for old, new in json.loads(merged).items()}
+            merged[source] = target
+            db.execute("UPDATE sessions SET merged = ? WHERE id = ?", (json.dumps(merged), session_id))
+
+    def speaker_labels(self, session_id: int) -> dict[str, str]:
+        """Speaker id -> label, merged-away ids included: reports written before a merge still name them."""
+        labels = {r["id"]: r["label"] for r in self._all(
+            "SELECT id, label FROM speakers WHERE session_id = ? ORDER BY rowid", (session_id,))}
+        row = self.session(session_id)
+        for old, new in (row["merged"] if row else {}).items():
+            if new in labels:
+                labels[old] = labels[new]
+        return labels
+
+    def last_spoken(self, session_id: int) -> dict[str, float]:
+        return {r["speaker"]: r["last"] for r in self._all(
+            "SELECT speaker, MAX(end) AS last FROM segments WHERE session_id = ? GROUP BY speaker", (session_id,))}
 
     # segments and units
     def add_segment(self, session_id: int, seg: dict) -> int:
@@ -369,6 +434,12 @@ class SeminarStore:
             (session_id, seg["start"], seg["end"], seg["speaker"], seg["lang"], seg["text"], int(seg["complete"]),
              pack(seg.get("embedding"))),
         )
+
+    def recent_segments(self, session_id: int, limit: int) -> list[dict]:
+        rows = self._all(
+            "SELECT speaker, text FROM segments WHERE session_id = ? ORDER BY id DESC LIMIT ?", (session_id, limit)
+        )
+        return rows[::-1]
 
     def pending_segments(self, session_id: int) -> list[dict]:
         return self._all(
@@ -387,6 +458,11 @@ class SeminarStore:
             ).lastrowid
             db.executemany("UPDATE segments SET unit_id = ? WHERE id = ?", [(uid, s) for s in segment_ids])
         return {"id": uid, **unit}
+
+    def count_units(self, session_id: int, after_id: int = 0) -> int:
+        return self._all(
+            "SELECT COUNT(*) AS n FROM units WHERE session_id = ? AND id > ?", (session_id, after_id)
+        )[0]["n"]
 
     def units(self, session_id: int, start: float | None = None, end: float | None = None, limit: int | None = None) -> list[dict]:
         sql = "SELECT id, start, end, speaker, lang, target, source, translation, note FROM units WHERE session_id = ?"
@@ -451,13 +527,37 @@ def wav_seconds(wav: bytes) -> float:
     return max(0.0, (len(wav) - 44) / 32000)
 
 
+def trim_wav(wav: bytes, seconds: float) -> bytes:
+    """The first `seconds` of a WAV clip (unchanged if shorter or unreadable)."""
+    try:
+        with wave.open(io.BytesIO(wav)) as r:
+            params, frames = r.getparams(), int(seconds * r.getframerate())
+            if r.getnframes() <= frames:
+                return wav
+            data = r.readframes(frames)
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setparams(params)
+            w.writeframes(data)
+        return buf.getvalue()
+    except (wave.Error, EOFError):
+        return wav
+
+
+def normalized(text: str) -> str:
+    return " ".join(re.sub(r"[\W_]+", " ", text.lower()).split())
+
+
 def public_speaker(sp: dict) -> dict:
     return {"id": sp["id"], "label": sp["label"], "voice": sp["voice"]}
 
 
 class LiveSession:
     """Working state of one seminar. Listening and interpreting run as two ordered queues,
-    so the next phrase is transcribed while the previous thought is being interpreted."""
+    so the next phrase is transcribed while the previous thought is being interpreted.
+
+    Answers about a phrase (heard, empty, error) go only to the socket that sent it, as its
+    acknowledgement; everything else is broadcast to every device on the seminar."""
 
     def __init__(self, session_id: int, store: SeminarStore, ai: SeminarAI, voiceprints: Voiceprints | None, tz: ZoneInfo):
         self.id = session_id
@@ -469,19 +569,29 @@ class LiveSession:
         self.partner = row["partner"]
         self.notes = row["notes"]
         self.speakers = {sp["id"]: sp for sp in store.speakers(session_id)}
-        self.merged: dict[str, str] = {}  # merged-away speaker id -> the one it became
+        self.merged: dict[str, str] = row["merged"]  # merged-away speaker id -> the one it became
+        self.last_spoken: dict[str, float] = store.last_spoken(session_id)
         self.pending: list[dict] = []  # phrases of the thought in progress
         restored = self._regroup(store.pending_segments(session_id))
-        self.recent_lines: deque[str] = deque(maxlen=8)
-        self.recent_units: deque[str] = deque(
-            (f"[{self.label(u['speaker'])}] {u['translation']}" for u in store.units(session_id, limit=RECENT_UNITS)),
+        # (speaker id, text): rendered with the current ids and labels, so renames and merges show up at once
+        self.recent_lines: deque[tuple[str, str]] = deque(
+            ((s["speaker"], s["text"]) for s in store.recent_segments(session_id, RECENT_LINES)), maxlen=RECENT_LINES
+        )
+        self.recent_units: deque[tuple[str, str]] = deque(
+            ((u["speaker"], u["translation"]) for u in store.units(session_id, limit=RECENT_UNITS) if u["translation"]),
             maxlen=RECENT_UNITS,
         )
-        self.units_since_notes = 0
+        self.read_out: deque[tuple[float, list[str]]] = deque()  # (time, normalized translation and its sentences)
+        self.units_since_notes = store.count_units(session_id, row["notes_unit"])
         self.working = 0  # phrases or thoughts being processed right now
         self.listening = 0  # phrases being transcribed right now
         self.interpreting = 0  # thoughts being interpreted right now
         self.clients: set = set()
+        self.speaking: set = set()  # clients whose microphone hears speech right now
+        self.idle_since = time.monotonic()  # when the last client left
+        self.received: OrderedDict[tuple[str, int], float] = OrderedDict()  # (client, phrase id) -> when
+        self.flush_requested = False
+        self.closed = False
         self.listen_queue: asyncio.Queue = asyncio.Queue()
         self.unit_queue: asyncio.Queue = asyncio.Queue()
         self.idle_timer: asyncio.TimerHandle | None = None
@@ -515,13 +625,23 @@ class LiveSession:
         return sp["label"] if sp else speaker_id
 
     def resolve(self, speaker_id: str) -> str:
-        """Follows merges, for thoughts that were already on their way when the speakers were merged."""
+        """Follows merges, for thoughts and answers that were already on their way when the speakers were merged."""
         while speaker_id in self.merged:
             speaker_id = self.merged[speaker_id]
         return speaker_id
 
+    def recent_transcript(self) -> list[str]:
+        return [f"[{self.resolve(sid)} {self.label(sid)}] {text}" for sid, text in self.recent_lines]
+
+    def recent_interpretation(self) -> list[str]:
+        return [f"[{self.label(sid)}] {text}" for sid, text in self.recent_units]
+
     def busy(self) -> bool:
         return bool(self.pending) or self.working > 0 or not self.listen_queue.empty() or not self.unit_queue.empty()
+
+    def interpreting_count(self) -> int:
+        """Thoughts waiting for or in interpretation."""
+        return self.unit_queue.qsize() + self.interpreting
 
     async def broadcast(self, message: dict):
         for ws in list(self.clients):
@@ -530,15 +650,66 @@ class LiveSession:
             except Exception:
                 self.clients.discard(ws)
 
+    async def _reply(self, ws, message: dict):
+        """An answer about one phrase, to the device that sent it (it may have gone meanwhile)."""
+        if ws is None:
+            return
+        try:
+            await ws.send_json(message)
+        except Exception:
+            self.clients.discard(ws)
+
     def close(self):
+        self.closed = True
         for task in self.workers:
             task.cancel()
+        if self.notes_task:
+            self.notes_task.cancel()
         if self.idle_timer:
             self.idle_timer.cancel()
+            self.idle_timer = None
+
+    # --- clients
+    def join(self, ws):
+        self.clients.add(ws)
+
+    def leave(self, ws):
+        self.clients.discard(ws)
+        if ws in self.speaking:
+            self.set_speaking(ws, False)  # a device that is gone is not talking
+        if not self.clients:
+            self.idle_since = time.monotonic()
+
+    def set_speaking(self, ws, active: bool):
+        """A device's microphone started or stopped hearing speech: a thought isn't over while someone talks,
+        and the pause before the idle flush counts from when they stopped."""
+        if active:
+            self.speaking.add(ws)
+            return
+        self.speaking.discard(ws)
+        if self.pending:
+            self._arm_idle_flush()
 
     # --- input
-    async def add_audio(self, client_id: int, wav: bytes, received: float | None = None):
-        await self.listen_queue.put((client_id, wav, received or time.time()))
+    def queue_full(self) -> bool:
+        return self.listen_queue.qsize() >= MAX_QUEUED_SEGMENTS
+
+    def received_before(self, client: str, seg_id: int) -> bool:
+        """A phrase resent after a reconnect that already arrived (it may still be waiting in the queue)."""
+        self._forget_old_phrases()
+        return bool(client) and (client, seg_id) in self.received
+
+    def _forget_old_phrases(self):
+        cutoff = time.monotonic() - DEDUPE_SECONDS
+        while self.received and next(iter(self.received.values())) < cutoff:
+            self.received.popitem(last=False)
+
+    async def add_audio(self, seg_id: int, wav: bytes, received: float | None = None, origin=None, client: str = ""):
+        """origin: the socket that sent the phrase and gets the answer; client: the sending page, for deduplication."""
+        if client:
+            self._forget_old_phrases()
+            self.received[(client, seg_id)] = time.monotonic()
+        await self.listen_queue.put((seg_id, wav, received or time.time(), origin))
 
     def set_partner(self, partner: str):
         self.partner = partner
@@ -554,60 +725,101 @@ class LiveSession:
             self.unit_queue.put_nowait(segments)
             asyncio.ensure_future(self.broadcast_pending())
 
+    def request_flush(self):
+        """A device stopped listening: what is left is interpreted once the phrases already sent are transcribed."""
+        self.flush_requested = True
+        self._flush_if_drained()
+
+    def _flush_if_drained(self):
+        if self.flush_requested and self.listen_queue.empty() and self.listening == 0:
+            self.flush_requested = False
+            self.flush()
+
     async def broadcast_pending(self):
         """What is being said right now (not interpreted yet) and how many thoughts are in translation."""
         await self.broadcast({
             "type": "pending",
             "pending": [{"speaker": p["speaker"], "lang": p["lang"], "text": p["text"]} for p in self.pending],
-            "interpreting": self.unit_queue.qsize() + self.interpreting,
+            "interpreting": self.interpreting_count(),
         })
 
     # --- stage 1: listen
     async def _listen_worker(self):
         while True:
-            client_id, wav, received = await self.listen_queue.get()
+            seg_id, wav, received, origin = await self.listen_queue.get()
             self.working += 1
             self.listening += 1
             try:
-                await self._listen_with_retry(client_id, wav, received)
+                await self._listen_with_retry(seg_id, wav, received, origin)
             finally:
                 self.working -= 1
                 self.listening -= 1
+                self._flush_if_drained()
 
-    async def _listen_with_retry(self, client_id: int, wav: bytes, received: float):
-        for attempt in (1, 2):
-            try:
-                await self._listen(client_id, wav, received)
-                return
-            except Exception:
-                log.exception("Listening failed in session %s (attempt %d)", self.id, attempt)
-                if attempt == 1:
-                    await asyncio.sleep(RETRY_DELAY)
-        await self.broadcast({"type": "error", "id": client_id, "message": "Eshitib bo'lmadi"})
-
-    async def _listen(self, client_id: int, wav: bytes, received: float):
-        seconds = wav_seconds(wav)
+    async def _listen_with_retry(self, seg_id: int, wav: bytes, received: float, origin):
         embedding = None
         if self.voiceprints:
             try:
                 embedding = await asyncio.to_thread(self.voiceprints.embed, wav)
             except Exception:
                 log.exception("Voiceprint failed")
-        sims = {}
-        if embedding is not None:
-            sims = {sid: cosine(embedding, sp["centroid"]) for sid, sp in self.speakers.items() if sp["centroid"] is not None}
-        # Reference recordings are most of the cost of a phrase: send them only when the voiceprints can't decide.
-        best = max(sims.values(), default=0.0)
-        unknown_voice = any(sp["centroid"] is None for sp in self.speakers.values())
-        decided = sims and (best >= SAME_VOICE or (best < NEW_VOICE and not unknown_voice))
+        # an outage or a rate limit passes: keep the phrase a while, unless the queue behind it is full
+        deadline, delay = time.monotonic() + LISTEN_RETRY_SECONDS, RETRY_DELAY
+        while True:
+            try:
+                await self._listen(seg_id, wav, received, origin, embedding)
+                return
+            except Exception:
+                log.exception("Listening failed in session %s", self.id)
+            if self.closed or self.queue_full() or time.monotonic() + delay > deadline:
+                break
+            await asyncio.sleep(delay)
+            delay *= 2
+        await self._reply(origin, {"type": "error", "id": seg_id, "message": "Eshitib bo'lmadi"})
+
+    def _similarities(self, embedding) -> dict[str, float]:
+        if embedding is None:
+            return {}
+        return {sid: cosine(embedding, sp["centroid"]) for sid, sp in self.speakers.items() if sp["centroid"] is not None}
+
+    def _unknown_voices(self) -> bool:
+        """Is there a speaker Gemini could recognise by their reference clip but the voiceprints can't
+        (no voiceprint yet), who still speaks in this part of the seminar?"""
+        latest = max(self.last_spoken.values(), default=0.0)
+        return any(
+            sp["centroid"] is None and sp["ref_wav"] and sp["ref_seconds"] >= REFERENCE_MIN_SECONDS
+            and latest - self.last_spoken.get(sp["id"], latest) < UNKNOWN_VOICE_SILENT_SECONDS
+            for sp in self.speakers.values()
+        )
+
+    def _voice_verdict(self, sims: dict, seconds: float) -> tuple[bool, str | None]:
+        """Whether the voiceprints alone settle who speaks, and who (None: someone new). The same rule
+        decides whether Gemini gets reference recordings and whether its answer is overruled."""
+        if not sims:
+            return False, None
+        best_id, best = max(sims.items(), key=lambda kv: kv[1])
+        if best >= SAME_VOICE:
+            return True, best_id
+        # a short clip of a known person often scores low: only a long, clearly different voice is someone new
+        if best < SURELY_NEW_VOICE and seconds >= NEW_VOICE_MIN_SECONDS and not self._unknown_voices():
+            return True, None
+        return False, None
+
+    async def _listen(self, seg_id: int, wav: bytes, received: float, origin, embedding):
+        seconds = wav_seconds(wav)
+        sims = self._similarities(embedding)
+        decided, voice_id = self._voice_verdict(sims, seconds)
+        # Reference recordings are most of the cost of a phrase: send them only when Gemini's answer counts.
         references = [] if decided else self._references(sims)
         heard = await asyncio.to_thread(
-            self.ai.listen, wav, references, {sid: sims[sid] for sid in sims}, list(self.recent_lines), self.notes
+            self.ai.listen, wav, references, sims, self.recent_transcript(), self.notes,
+            identified=(voice_id or "new") if decided else None,
         )
-        if not heard.text:
-            await self.broadcast({"type": "empty", "id": client_id})
+        if not heard.text or self._is_echo(heard.text):
+            await self._reply(origin, {"type": "empty", "id": seg_id})
             return
-        speaker_id = await self._resolve_speaker(heard, sims, embedding, wav, seconds)
+        # resolved again: the speakers may have been merged while the speaker message was being sent
+        speaker_id = self.resolve(await self._resolve_speaker(heard, embedding, wav, seconds))
         seg = {
             "start": received - seconds,
             "end": received,
@@ -622,9 +834,10 @@ class LiveSession:
         seg["id"] = self.store.add_segment(self.id, seg)
         seg.pop("embedding")
         self.pending.append(seg)
-        self.recent_lines.append(f"[{speaker_id} {self.label(speaker_id)}] {heard.text}")
-        await self.broadcast({"type": "heard", "id": client_id, "speaker": speaker_id, "lang": heard.source_lang,
-                              "text": heard.text, "complete": heard.complete})
+        self.recent_lines.append((speaker_id, heard.text))
+        self.last_spoken[speaker_id] = max(received, self.last_spoken.get(speaker_id, 0.0))
+        await self._reply(origin, {"type": "heard", "id": seg_id, "speaker": speaker_id, "lang": heard.source_lang,
+                                   "text": heard.text, "complete": heard.complete})
         pending_seconds = sum(s["end"] - s["start"] for s in self.pending)
         if heard.complete or pending_seconds >= UNIT_MAX_SECONDS:
             self.flush()
@@ -632,56 +845,87 @@ class LiveSession:
             self._arm_idle_flush()
             await self.broadcast_pending()
 
+    def _is_echo(self, text: str) -> bool:
+        """A translation read out aloud by a device in the room and picked up by a microphone again:
+        interpreting it would feed it back to the read-out, again and again."""
+        cutoff = time.monotonic() - ECHO_SECONDS
+        while self.read_out and self.read_out[0][0] < cutoff:
+            self.read_out.popleft()
+        phrase = normalized(text)
+        return bool(phrase) and any(
+            SequenceMatcher(None, phrase, part).ratio() >= ECHO_SIMILARITY for _, parts in self.read_out for part in parts
+        )
+
     def _arm_idle_flush(self):
+        if self.closed:
+            return
         if self.idle_timer:
             self.idle_timer.cancel()
         self.idle_timer = asyncio.get_running_loop().call_later(IDLE_FLUSH_SECONDS, self._idle_flush)
 
     def _idle_flush(self):
         self.idle_timer = None
-        if self.listen_queue.empty() and self.listening == 0:
+        if self.speaking or not self.listen_queue.empty() or self.listening:
+            self._arm_idle_flush()  # someone is still talking, or more speech is on its way: it may complete the thought
+        else:
             self.flush()
-        else:  # more speech is on its way: let it complete the thought
-            self._arm_idle_flush()
 
     def _references(self, sims: dict) -> list[dict]:
-        """The most likely speakers' recordings, so Gemini can compare voices (unknown similarity ranks mid-way)."""
-        ranked = sorted(self.speakers.values(), key=lambda sp: -sims.get(sp["id"], (SAME_VOICE + NEW_VOICE) / 2))
-        return [sp for sp in ranked if sp["ref_wav"]][:MAX_REFERENCE_SPEAKERS]
+        """The likeliest speakers' recordings, so Gemini can compare voices: by voiceprint similarity (unknown
+        ranks mid-way), then by who spoke last; whoever is in the recent transcript is always among them."""
+        mid = (SAME_VOICE + NEW_VOICE) / 2
+        ranked = sorted(
+            (sp for sp in self.speakers.values() if sp["ref_wav"]),
+            key=lambda sp: (-sims.get(sp["id"], mid), -self.last_spoken.get(sp["id"], 0.0)),
+        )
+        recent = {self.resolve(sid) for sid, _ in self.recent_lines}
+        chosen = [sp["id"] for sp in ranked if sp["id"] in recent][:MAX_REFERENCE_SPEAKERS]
+        chosen += [sp["id"] for sp in ranked if sp["id"] not in recent][: MAX_REFERENCE_SPEAKERS - len(chosen)]
+        return [sp for sp in ranked if sp["id"] in chosen]
 
-    async def _resolve_speaker(self, heard: Heard, sims: dict, embedding, wav: bytes, seconds: float) -> str:
+    async def _resolve_speaker(self, heard: Heard, embedding, wav: bytes, seconds: float) -> str:
+        # compared again: the speakers may have been merged while Gemini was listening
+        sims = self._similarities(embedding)
         best_id, best = max(sims.items(), key=lambda kv: kv[1]) if sims else (None, 0.0)
-        gemini_id = heard.speaker if heard.speaker in self.speakers else None
-        if best_id and best >= SAME_VOICE:
-            speaker_id, confident = best_id, True
-        elif sims and best < NEW_VOICE and not (gemini_id and self.speakers[gemini_id]["centroid"] is None):
-            speaker_id, confident = None, True
-        else:  # voices are ambiguous (or no voiceprints): Gemini's judgement with the context decides
+        named = self.resolve(heard.speaker)
+        gemini_id = named if named in self.speakers else None
+        decided, voice_id = self._voice_verdict(sims, seconds)
+        if decided:
+            speaker_id, confident = voice_id, True
+        else:  # the voices alone can't tell: Gemini's judgement with the context decides
             speaker_id = gemini_id
-            confident = gemini_id is not None and gemini_id == best_id
+            # trusted enough to learn from: the voiceprint agrees, or without one there was nobody else to pick
+            confident = gemini_id is not None and (
+                gemini_id == best_id and best >= NEW_VOICE if sims else len(self.speakers) == 1
+            )
+        # Gemini's name for the speaker counts only if it meant the same person
+        name = heard.speaker_name if gemini_id == speaker_id else ""
+        good_voiceprint = embedding is not None and seconds >= CENTROID_MIN_SECONDS
         changed = False
         if speaker_id is None:
             used = [*self.speakers, *self.merged]  # never reissue a merged-away id
             n = 1 + max([int(s[1:]) for s in used if s[1:].isdigit()] or [0])
-            sp = {"id": f"S{n}", "label": heard.speaker_name or f"Spiker {n}", "named": bool(heard.speaker_name),
-                  "voice": heard.voice, "ref_wav": wav, "ref_seconds": seconds, "centroid": embedding,
-                  "samples": 1 if embedding is not None else 0}
+            sp = {"id": f"S{n}", "label": name or f"Spiker {n}", "named": bool(name), "voice": heard.voice,
+                  "ref_wav": trim_wav(wav, GOOD_REFERENCE_SECONDS[1]),
+                  "ref_seconds": min(seconds, GOOD_REFERENCE_SECONDS[1]),
+                  "centroid": embedding if good_voiceprint else None, "samples": 1 if good_voiceprint else 0}
             self.speakers[sp["id"]] = sp
             changed = True
         else:
             sp = self.speakers[speaker_id]
-            if heard.speaker_name and not sp["named"]:
-                sp["label"], sp["named"] = heard.speaker_name, True
+            if name and not sp["named"]:
+                sp["label"], sp["named"] = name, True
                 changed = True
-            if embedding is not None and (confident or sp["centroid"] is None):
+            if good_voiceprint and (confident or sp["centroid"] is None):
                 n = sp["samples"]
                 sp["centroid"] = embedding if sp["centroid"] is None else (sp["centroid"] * n + embedding) / (n + 1)
                 sp["samples"] = n + 1
-            low, high = GOOD_REFERENCE_SECONDS
-            if sp["ref_seconds"] < low and seconds > sp["ref_seconds"] and seconds <= high:
-                sp["ref_wav"], sp["ref_seconds"] = wav, seconds
-            if not sp["voice"] and heard.voice:
-                sp["voice"] = heard.voice
+            if confident:  # a wrong attribution must not give someone another person's voice
+                low, high = GOOD_REFERENCE_SECONDS
+                if sp["ref_seconds"] < low and seconds > sp["ref_seconds"] and seconds <= high:
+                    sp["ref_wav"], sp["ref_seconds"] = wav, seconds
+                if not sp["voice"] and heard.voice:
+                    sp["voice"] = heard.voice
         self.store.save_speaker(self.id, sp)
         if changed:
             await self.broadcast({"type": "speaker", "speaker": public_speaker(sp)})
@@ -711,7 +955,7 @@ class LiveSession:
         for attempt in (1, 2):
             try:
                 rendered = await asyncio.to_thread(
-                    self.ai.interpret, source, lang, self.label(speaker_id), target, list(self.recent_units), self.notes
+                    self.ai.interpret, source, lang, self.label(speaker_id), target, self.recent_interpretation(), self.notes
                 )
                 break
             except Exception:
@@ -726,7 +970,11 @@ class LiveSession:
             [s["id"] for s in segments],
         )
         if rendered.translation:
-            self.recent_units.append(f"[{self.label(speaker_id)}] {rendered.translation}")
+            self.recent_units.append((speaker_id, rendered.translation))
+            # a read-out may reach a microphone cut into sentences
+            sentences = re.split(r"(?<=[.!?…])\s+", rendered.translation)
+            parts = {normalized(p) for p in (rendered.translation, *sentences)} - {""}
+            self.read_out.append((time.monotonic(), sorted(parts)))
         await self.broadcast({"type": "unit", "unit": unit})
         self.units_since_notes += 1
         due = NOTES_EVERY_UNITS if self.notes.get("summary") else NOTES_FIRST_AFTER_UNITS
@@ -738,10 +986,11 @@ class LiveSession:
         try:
             units = self.store.units(self.id, limit=NOTES_EVERY_UNITS * 2)
             lines = [f"[{self.label(u['speaker'])}] {u['source']} => {u['translation']}" for u in units]
-            labels = [f"{sid} = {sp['label']}" for sid, sp in self.speakers.items()]
+            labels = [sp["label"] for sp in self.speakers.values()]
             notes = await asyncio.to_thread(self.ai.update_notes, self.notes, lines, labels)
             self.notes = notes.model_dump()
-            self.store.update_session(self.id, notes=self.notes)
+            # where the notes stand survives a reload, so a device reconnecting often doesn't keep resetting the count
+            self.store.update_session(self.id, notes=self.notes, notes_unit=max((u["id"] for u in units), default=0))
             await self.broadcast({"type": "notes", "notes": self.notes})
         except Exception:
             log.exception("Notes update failed in session %s", self.id)
@@ -766,6 +1015,8 @@ class LiveSession:
         for old, new in self.merged.items():
             if new == source:
                 self.merged[old] = target
+        if source in self.last_spoken:
+            self.last_spoken[target] = max(self.last_spoken.pop(source), self.last_spoken.get(target, 0.0))
         self.store.merge_speakers(self.id, source, target)
         self.store.save_speaker(self.id, dst)
         for seg in self.pending:

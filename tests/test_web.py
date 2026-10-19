@@ -69,7 +69,7 @@ class FakeAI:
         self.listening = threading.Event()  # set once listen() is entered
         self.interpreting = threading.Event()
 
-    def listen(self, wav, references, similarities, recent, notes):
+    def listen(self, wav, references, similarities, recent, notes, identified=None):
         self.listening.set()
         if self.listen_gate:
             assert self.listen_gate.wait(5)
@@ -133,6 +133,7 @@ class FakeVoiceprints:
 def fast(monkeypatch):
     monkeypatch.setattr(web, "LOGIN_FAIL_DELAY", 0)
     monkeypatch.setattr(web, "UNLOAD_CHECK_SECONDS", 0.02)
+    monkeypatch.setattr(web, "UNLOAD_GRACE_SECONDS", 0.0)  # tests that need the grace period set it
     monkeypatch.setattr(seminar, "RETRY_DELAY", 0.01)
     monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 30.0)  # thoughts are flushed explicitly unless a test shortens it
 
@@ -185,7 +186,7 @@ def lives(monkeypatch):
     class SpyLiveSession(seminar.LiveSession):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
-            self.closed = 0
+            self.close_calls = 0
             self.closed_off_loop = False
             loaded.append(self)
 
@@ -194,16 +195,16 @@ def lives(monkeypatch):
                 asyncio.get_running_loop()
             except RuntimeError:  # called from a worker thread, not from the event loop
                 self.closed_off_loop = True
-            self.closed += 1
+            self.close_calls += 1
             super().close()
 
     monkeypatch.setattr(web, "LiveSession", SpyLiveSession)
     return loaded
 
 
-def frame(seg_id: int, wav: bytes = WAV, ended_at: float | None = None) -> bytes:
-    """Browser frame: 4-byte big-endian id, 8-byte big-endian float64 capture end time, WAV."""
-    return struct.pack(">Id", seg_id, time.time() if ended_at is None else ended_at) + wav
+def frame(seg_id: int, wav: bytes = WAV, age: float = 0.0) -> bytes:
+    """Browser frame: 4-byte big-endian id, 8-byte big-endian float64 seconds since the phrase ended, WAV."""
+    return struct.pack(">Id", seg_id, age) + wav
 
 
 def recv(ws, timeout: float = 3.0) -> dict:
@@ -515,7 +516,7 @@ def test_phrase_is_heard_and_interpreted(client, ai, store, sid):
     ai.heards = [heard("Привет, коллеги", voice="deep male"), heard("Начнём", speaker="S1")]
     ended = time.time() - 5
     with client.websocket_connect(f"/ws?session={sid}") as ws:
-        ws.send_bytes(frame(7, WAV, ended))
+        ws.send_bytes(frame(7, WAV, age=5.0))  # ended 5 s ago
         unit_msg, seen = recv_until(ws, "unit")
         kinds = [m["type"] for m in seen]
         assert kinds.index("speaker") < kinds.index("heard") < kinds.index("unit")
@@ -526,8 +527,9 @@ def test_phrase_is_heard_and_interpreted(client, ai, store, sid):
             "type": "heard", "id": 7, "speaker": "S1", "lang": "ru", "text": "Привет, коллеги", "complete": True,
         }
         unit = unit_msg["unit"]
+        assert unit["end"] == pytest.approx(ended, abs=1) and unit["start"] == pytest.approx(unit["end"] - 1.0)
         assert unit == {
-            "id": unit["id"], "start": ended - 1.0, "end": ended, "speaker": "S1", "lang": "ru", "target": "uz",
+            "id": unit["id"], "start": unit["start"], "end": unit["end"], "speaker": "S1", "lang": "ru", "target": "uz",
             "source": "Привет, коллеги", "translation": "uz: Привет, коллеги", "note": "",
         }
         listen = ai.listen_calls[0]
@@ -554,28 +556,29 @@ def test_phrase_is_heard_and_interpreted(client, ai, store, sid):
 def test_voiceprints_decide_the_speaker_when_they_are_sure(make, ai, sid):
     voiceprints = FakeVoiceprints([1, 0], [1, 0], [0, 1])
     client = make(voiceprints=voiceprints)
-    # Gemini is wrong twice; the voiceprints overrule it
+    # Gemini is wrong twice; the voiceprints overrule it (long clips: short ones are left to Gemini)
     ai.heards = [heard("Bir"), heard("Ikki", speaker="new"), heard("Uch", speaker="S1")]
     with client.websocket_connect(f"/ws?session={sid}") as ws:
         units = []
         for i in (1, 2, 3):
-            ws.send_bytes(frame(i))
+            ws.send_bytes(frame(i, make_wav(3.0)))
             units.append(recv_until(ws, "unit")[0]["unit"])
     assert [u["speaker"] for u in units] == ["S1", "S1", "S2"]
     assert ai.listen_calls[1].similarities == {"S1": pytest.approx(1.0)}
     assert ai.listen_calls[2].similarities == {"S1": pytest.approx(0.0)}
 
 
-def test_ai_failures_are_retried_then_reported(client, ai, sid):
-    ai.heards = [RuntimeError("Gemini 503"), heard("Снова"), RuntimeError("503"), RuntimeError("503"), heard("")]
+def test_ai_failures_are_retried_then_reported(client, ai, sid, monkeypatch):
+    ai.heards = [RuntimeError("Gemini 503"), RuntimeError("429"), heard("Снова"), RuntimeError("503"), heard("")]
     ai.interpret_errors = [RuntimeError("503"), RuntimeError("503")]
     with client.websocket_connect(f"/ws?session={sid}") as ws:
-        ws.send_bytes(frame(1))  # fails once, works on the retry
+        ws.send_bytes(frame(1))  # fails twice, works on the third try
         assert recv_until(ws, "heard")[0]["text"] == "Снова"
         unit, _ = recv_until(ws, "unit")
         # interpreting failed twice: the original words are kept untranslated
         assert unit["unit"]["source"] == "Снова" and unit["unit"]["translation"] == ""
-        ws.send_bytes(frame(2))  # fails twice
+        monkeypatch.setattr(seminar, "LISTEN_RETRY_SECONDS", 0)  # the retry time is used up
+        ws.send_bytes(frame(2))
         assert recv_until(ws, "error")[0] == {"type": "error", "id": 2, "message": "Eshitib bo'lmadi"}
         ws.send_bytes(frame(3))  # silence
         assert recv_until(ws, "empty")[0] == {"type": "empty", "id": 3}
@@ -596,48 +599,42 @@ def test_notes_are_updated_and_broadcast(client, ai, store, sid, monkeypatch):
 # ---------------------------------------------------------------- live audio: frames
 
 
-def unit_for_capture_time(client, sid, ended_at) -> dict:
+def unit_for_age(client, sid, age) -> dict:
     with client.websocket_connect(f"/ws?session={sid}") as ws:
-        ws.send_bytes(frame(1, WAV, ended_at))
+        ws.send_bytes(frame(1, WAV, age))
         return recv_until(ws, "unit")[0]["unit"]
 
 
-@pytest.mark.parametrize("offset", [-5.0, -3600.0, -(web.MAX_CLOCK_SKEW - 300), 30.0])
-def test_capture_time_is_honoured_when_plausible(client, sid, offset):
-    ended = time.time() + offset
-    unit = unit_for_capture_time(client, sid, ended)
-    assert unit["end"] == ended and unit["start"] == ended - 1.0  # phrase sent late keeps its real time
+@pytest.mark.parametrize("age", [0.0, 5.0, 3600.0, web.MAX_FRAME_AGE - 300])
+def test_phrase_age_places_it_in_the_timeline(client, sid, age):
+    """The age, not the device's clock: a phrase resent late keeps its real time, whatever the device's clock says."""
+    before = time.time()
+    unit = unit_for_age(client, sid, age)
+    after = time.time()
+    assert before - age <= unit["end"] <= after - age
+    assert unit["start"] == pytest.approx(unit["end"] - 1.0)
 
 
 @pytest.mark.parametrize(
-    "ended_at",
-    [
-        lambda now: now - web.MAX_CLOCK_SKEW - 60,
-        lambda now: now + 120,
-        lambda now: now * 1000,  # milliseconds by mistake
-        lambda now: 0.0,
-        lambda now: -1.0,
-        lambda now: math.nan,
-        lambda now: math.inf,
-        lambda now: -math.inf,
-    ],
-    ids=["day-old", "future", "milliseconds", "zero", "negative", "nan", "inf", "-inf"],
+    "age",
+    [web.MAX_FRAME_AGE + 60, -1.0, -0.001, time.time(), time.time() * 1000, math.nan, math.inf, -math.inf],
+    ids=["over-a-day", "negative", "slightly-negative", "absolute-time", "milliseconds", "nan", "inf", "-inf"],
 )
-def test_skewed_capture_time_is_replaced_by_server_time(client, sid, ended_at):
+def test_implausible_age_is_replaced_by_arrival_time(client, sid, age):
     before = time.time()
-    unit = unit_for_capture_time(client, sid, ended_at(before))
+    unit = unit_for_age(client, sid, age)
     after = time.time()
     assert before <= unit["end"] <= after
     assert unit["start"] == pytest.approx(unit["end"] - 1.0)
 
 
 def test_malformed_frames_are_rejected(client, ai, sid):
-    header = struct.pack(">Id", 9, time.time())
+    header = struct.pack(">Id", 9, 0.0)
     bad = [
         b"",
         b"\x00\x01",
         header + b"x" * 60,  # not a WAV file
-        struct.pack(">I", 9) + WAV,  # old frame format without the capture time
+        struct.pack(">I", 9) + WAV,  # old frame format without the age
         header + b"RIFF" + WAV[4:8] + b"AVI " + WAV[12:],
         header + WAV[:43],  # cut inside the WAV header
     ]
@@ -662,7 +659,7 @@ def test_oversized_frame_is_rejected(client, ai, sid, monkeypatch):
 
 
 def test_queue_limit_protects_the_budget(client, ai, sid, monkeypatch):
-    monkeypatch.setattr(web, "MAX_QUEUED_SEGMENTS", 3)
+    monkeypatch.setattr(seminar, "MAX_QUEUED_SEGMENTS", 3)
     ai.listen_gate = threading.Event()
     ai.heards = [heard("")] * 5
     with client.websocket_connect(f"/ws?session={sid}") as ws:
@@ -746,6 +743,142 @@ def test_odd_text_messages_do_not_kill_the_socket(client, ai, store, sid, text):
         ws.send_bytes(frame(1))
         assert recv_until(ws, "unit")[0]["unit"]["target"] == "uz"
     assert store.session(sid)["partner"] == "uz"
+
+
+# ---------------------------------------------------------------- live audio: acknowledgements, resends, speech, ping
+
+
+def kinds(messages) -> list[str]:
+    return [m["type"] for m in messages]
+
+
+def test_answers_about_a_phrase_go_only_to_the_device_that_sent_it(client, ai, sid):
+    ai.heards = [heard("Привет"), heard("")]
+    with client.websocket_connect(f"/ws?session={sid}&client=a") as sender, \
+            client.websocket_connect(f"/ws?session={sid}&client=b") as other:
+        sender.send_bytes(frame(1))
+        _, seen_other = recv_until(other, "unit")
+        heard_msg, seen_sender = recv_until(sender, "unit")
+        assert "heard" in kinds(seen_sender) and "heard" not in kinds(seen_other)
+        assert {"speaker", "unit"} <= set(kinds(seen_other))  # everything else is for every device
+        sender.send_bytes(frame(2))  # silence
+        assert recv_until(sender, "empty")[0] == {"type": "empty", "id": 2}
+        other.send_text(json.dumps({"type": "ping"}))
+        assert recv(other) == {"type": "pong"}  # the first thing it gets: no "empty" meant for the sender
+        sender.send_text(json.dumps({"type": "ping"}))
+        assert recv(sender) == {"type": "pong"}
+
+
+def test_resent_phrase_is_acknowledged_without_processing_it_again(client, ai, sid, lives, monkeypatch):
+    monkeypatch.setattr(web, "UNLOAD_GRACE_SECONDS", 30.0)
+    ai.heards = [heard("Bir"), heard("Ikki"), heard("Uch")]
+    url = f"/ws?session={sid}&client=page-1_A"
+    with client.websocket_connect(url) as ws:
+        ws.send_bytes(frame(1))
+        recv_until(ws, "heard")
+    with client.websocket_connect(url) as ws:  # its acknowledgement was lost: resent after a reconnect
+        ws.send_bytes(frame(1, age=4.0))
+        assert recv(ws) == {"type": "dup", "id": 1}
+        ws.send_bytes(frame(2))
+        assert recv_until(ws, "heard")[0]["id"] == 2
+    with client.websocket_connect(f"/ws?session={sid}&client=page-2") as ws:  # another page's phrase 1
+        ws.send_bytes(frame(1))
+        assert recv_until(ws, "heard")[0] == {"type": "heard", "id": 1, "speaker": "S1", "lang": "ru", "text": "Uch",
+                                              "complete": True}
+    assert len(ai.listen_calls) == 3 and len(lives) == 1
+
+
+def test_phrase_resent_while_still_queued_is_a_dup(client, ai, sid):
+    ai.listen_gate = threading.Event()
+    url = f"/ws?session={sid}&client=p"
+    with client.websocket_connect(url) as ws:
+        ws.send_bytes(frame(1))
+        assert ai.listening.wait(3)
+    with client.websocket_connect(url) as ws:
+        ws.send_bytes(frame(1))
+        assert recv(ws) == {"type": "dup", "id": 1}
+        ai.listen_gate.set()
+        _, seen = recv_until(ws, "unit")
+        assert "heard" not in kinds(seen)  # the answer went to the socket that sent it
+    assert len(ai.listen_calls) == 1
+
+
+@pytest.mark.parametrize("query", ["", "&client=", "&client=bad%20id", "&client=" + "x" * 41, "&client=a.b"])
+def test_without_a_valid_client_id_phrases_are_not_deduplicated(client, ai, sid, query):
+    with client.websocket_connect(f"/ws?session={sid}{query}") as ws:
+        for _ in range(2):
+            ws.send_bytes(frame(1))
+            assert recv_until(ws, "heard")[0]["id"] == 1
+    assert len(ai.listen_calls) == 2
+
+
+def test_speech_messages_hold_the_idle_flush(client, ai, store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 0.1)
+    ai.heards = [heard("Главная проблема в том,", complete=False)]
+    with client.websocket_connect(f"/ws?session={sid}") as ws:
+        ws.send_text(json.dumps({"type": "speech", "active": True}))  # the speaker goes on
+        ws.send_bytes(frame(1))
+        recv_until(ws, "pending")
+        time.sleep(0.4)
+        assert store.units(sid) == []
+        ws.send_text(json.dumps({"type": "speech", "active": False}))
+        stopped = time.monotonic()
+        unit, _ = recv_until(ws, "unit")
+        assert time.monotonic() - stopped >= 0.09  # the pause is counted from when the speech stopped
+    assert unit["unit"]["source"] == "Главная проблема в том,"
+
+
+@pytest.mark.parametrize("active", ["yes", 1, None])
+def test_speech_active_must_be_true(client, ai, store, sid, monkeypatch, active):
+    monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 0.1)
+    ai.heards = [heard("Итак", complete=False)]
+    with client.websocket_connect(f"/ws?session={sid}") as ws:
+        ws.send_text(json.dumps({"type": "speech", "active": active}))
+        ws.send_bytes(frame(1))
+        assert recv_until(ws, "unit")[0]["unit"]["source"] == "Итак"
+
+
+def test_a_device_that_disconnects_mid_speech_counts_as_silent(client, ai, store, sid, monkeypatch):
+    monkeypatch.setattr(seminar, "IDLE_FLUSH_SECONDS", 0.1)
+    ai.heards = [heard("Итак", complete=False)]
+    with client.websocket_connect(f"/ws?session={sid}") as listener:
+        with client.websocket_connect(f"/ws?session={sid}") as recorder:
+            recorder.send_text(json.dumps({"type": "speech", "active": True}))
+            recorder.send_bytes(frame(1))
+            recv_until(listener, "pending")
+            time.sleep(0.3)
+            assert store.units(sid) == []
+        assert recv_until(listener, "unit")[0]["unit"]["source"] == "Итак"
+
+
+def test_flush_waits_for_the_phrase_still_being_transcribed(client, ai, store, sid):
+    """Stop is pressed right after the last phrase: it is part of the thought, not a separate unit."""
+    ai.heards = [heard("Итак,", complete=False), heard("начнём", speaker="S1", complete=False)]
+    with client.websocket_connect(f"/ws?session={sid}") as ws:
+        ws.send_bytes(frame(1))
+        recv_until(ws, "pending")
+        ai.listening.clear()
+        ai.listen_gate = threading.Event()
+        ws.send_bytes(frame(2))
+        assert ai.listening.wait(3)
+        ws.send_text(json.dumps({"type": "flush"}))
+        time.sleep(0.2)
+        assert store.units(sid) == [] and ai.interpret_calls == []
+        ai.listen_gate.set()
+        unit, _ = recv_until(ws, "unit")
+    assert unit["unit"]["source"] == "Итак, начнём"
+
+
+def test_session_payload_counts_thoughts_in_interpretation(client, ai, sid):
+    ai.interpret_gate = threading.Event()
+    url = f"/api/sessions/{sid}"
+    with client.websocket_connect(f"/ws?session={sid}") as ws:
+        ws.send_bytes(frame(1))
+        assert ai.interpreting.wait(3)
+        assert client.get(url).json()["interpreting"] == 1  # a page reloading now shows "being translated"
+        ai.interpret_gate.set()
+        recv_until(ws, "unit")
+        wait_for(lambda: client.get(url).json()["interpreting"] == 0)
 
 
 # ---------------------------------------------------------------- sessions API
@@ -836,6 +969,7 @@ def test_session_payload_from_the_store(client, store, sid, lives, monkeypatch):
         "units": units[-3:],  # the newest ones, oldest first
         "units_on_page": 3,
         "pending": [{"speaker": "S2", "lang": "en", "text": "and so"}],
+        "interpreting": 0,
         "reports": [{"id": rid, "created_at": store.reports(sid)[0]["created_at"], "start": BASE, "end": BASE + 45,
                      "status": "done", "error": ""}],
     }
@@ -858,7 +992,7 @@ def test_delete_session_removes_everything(client, store, sid, seeded, lives):
     add_unit(store, other, BASE, BASE + 1, "S1", "a", "b")
     with client.websocket_connect(f"/ws?session={sid}"):
         assert client.delete(f"/api/sessions/{sid}").json() == {"ok": True}
-        assert lives[0].closed == 1
+        assert lives[0].close_calls == 1
     assert store.session(sid) is None
     assert store.units(sid) == [] and store.speakers(sid) == [] and store.reports(sid) == []
     assert len(store.units(other)) == 1  # other sessions are untouched
@@ -879,7 +1013,7 @@ def test_rename_speaker(client, store, sid, lives):
     assert speaker_row(store, sid, "S2")["label"] == "Spiker 2"
     labels = {sp["id"]: sp["label"] for sp in client.get(f"/api/sessions/{sid}").json()["speakers"]}
     assert labels == {"S1": "Dr. Karimov", "S2": "Spiker 2"}
-    wait_for(lambda: lives[0].closed == 1)  # nobody listens: the session is unloaded again
+    wait_for(lambda: lives[0].close_calls == 1)  # nobody listens: the session is unloaded again
 
     assert client.patch(url, json={"label": "k" * 100}).status_code == 200
     assert speaker_row(store, sid, "S1")["label"] == "k" * 80
@@ -901,7 +1035,7 @@ def test_rename_is_broadcast_to_listeners(client, store, sid, lives):
         assert client.patch(f"/api/sessions/{sid}/speakers/S1", json={"label": "Aziz"}).status_code == 200
         assert recv(ws) == {"type": "speaker", "speaker": {"id": "S1", "label": "Aziz", "voice": "soft"}}
         time.sleep(0.1)
-        assert lives[0].closed == 0  # still in use
+        assert lives[0].close_calls == 0  # still in use
 
 
 def test_merge_speakers(client, ai, store, sid, lives, monkeypatch):
@@ -925,7 +1059,7 @@ def test_merge_speakers(client, ai, store, sid, lives, monkeypatch):
     # the pending thought is finished by the idle flush, under the merged speaker
     wait_for(lambda: len(store.units(sid)) == 3)
     assert store.units(sid)[-1]["speaker"] == "S1" and ai.interpret_calls[0].speaker == "Dr. Karimov"
-    wait_for(lambda: lives[0].closed == 1)
+    wait_for(lambda: lives[0].close_calls == 1)
 
 
 def test_merge_rejects_bad_ids(client, store, sid):
@@ -1105,6 +1239,18 @@ def test_report_page_escapes_html(client, store, sid):
         assert escaped in page, escaped
 
 
+def test_report_names_merged_away_speakers_by_who_they_became(client, store, sid, seeded, lives):
+    """A report written before a merge still says S2: it reads as the person S2 was merged into."""
+    rid = store.save_report(sid, BASE, BASE + 3605, make_report().model_dump())  # Q&A asked by S2
+    assert client.post(f"/api/sessions/{sid}/speakers/S2/merge", json={"into": "S1"}).status_code == 200
+    wait_for(lambda: lives[0].close_calls == 1)  # even once the session is unloaded
+    page = client.get(f"/api/reports/{rid}").text
+    md = client.get(f"/api/reports/{rid}.md").text
+    assert "<b>10:10 Dr. Karimov:</b>" in page and "**10:10 Dr. Karimov:**" in md
+    assert "S2" not in page and "Spiker 2" not in page
+
+
+
 def test_report_downloads(client, store, sid, seeded):
     rid = make_report_now(client, sid, {})
 
@@ -1155,8 +1301,8 @@ def test_session_is_unloaded_when_the_last_client_leaves(client, ai, sid, lives)
         with client.websocket_connect(f"/ws?session={sid}"):
             pass  # a second tab closes: the first one still listens
         time.sleep(0.1)
-        assert len(lives) == 1 and lives[0].closed == 0
-    wait_for(lambda: lives[0].closed == 1)
+        assert len(lives) == 1 and lives[0].close_calls == 0
+    wait_for(lambda: lives[0].close_calls == 1)
 
     # loading it again restores the context from the database
     ai.heards = [heard("Ещё", speaker="S1")]
@@ -1174,9 +1320,9 @@ def test_unloading_waits_for_interpreting_to_finish(client, ai, store, sid, live
         ws.send_bytes(frame(1))
         assert ai.interpreting.wait(3)
     time.sleep(0.15)
-    assert lives[0].closed == 0 and store.units(sid) == []
+    assert lives[0].close_calls == 0 and store.units(sid) == []
     ai.interpret_gate.set()
-    wait_for(lambda: lives[0].closed == 1)
+    wait_for(lambda: lives[0].close_calls == 1)
     assert [u["source"] for u in store.units(sid)] == ["Привет"]  # finished after the client left
 
 
@@ -1187,8 +1333,8 @@ def test_unloading_waits_for_the_unfinished_thought(client, ai, store, sid, live
         ws.send_bytes(frame(1))
         recv_until(ws, "heard")
     time.sleep(0.1)
-    assert lives[0].closed == 0 and store.units(sid) == []  # the thought is still open
-    wait_for(lambda: lives[0].closed == 1)
+    assert lives[0].close_calls == 0 and store.units(sid) == []  # the thought is still open
+    wait_for(lambda: lives[0].close_calls == 1)
     assert [u["source"] for u in store.units(sid)] == ["Итак"]
 
 
@@ -1202,7 +1348,39 @@ def test_reconnecting_client_gets_the_work_started_before(client, ai, sid, lives
         ai.interpret_gate.set()
         unit, _ = recv_until(ws, "unit")
         assert unit["unit"]["source"] == "Привет"
-    wait_for(lambda: lives[0].closed == 1)
+    wait_for(lambda: lives[0].close_calls == 1)
+
+
+def test_session_stays_loaded_for_a_grace_period(client, ai, sid, lives, monkeypatch):
+    """A phone dropping off the Wi-Fi for a moment comes back to the same session in memory."""
+    monkeypatch.setattr(web, "UNLOAD_GRACE_SECONDS", 0.5)
+    with client.websocket_connect(f"/ws?session={sid}") as ws:
+        ws.send_bytes(frame(1))
+        recv_until(ws, "unit")
+    time.sleep(0.2)
+    assert lives[0].close_calls == 0
+    with client.websocket_connect(f"/ws?session={sid}"):
+        assert len(lives) == 1
+    left = time.monotonic()
+    wait_for(lambda: lives[0].close_calls == 1)
+    assert time.monotonic() - left >= 0.45  # counted from when the last device left
+    assert len(lives) == 1
+
+
+def test_deleted_session_leaves_no_task_behind(client, ai, sid, lives):
+    ai.heards = [heard("Итак", complete=False)]
+    with client.websocket_connect(f"/ws?session={sid}") as ws:
+        ws.send_bytes(frame(1))
+        recv_until(ws, "pending")  # an unfinished thought: the session is busy
+        assert client.delete(f"/api/sessions/{sid}").status_code == 200
+
+    def unload_tasks():
+        tasks = client.portal.call(asyncio.all_tasks)
+        return [t for t in tasks if t.get_coro().__qualname__.endswith("unload_when_idle")]
+
+    wait_for(lambda: not unload_tasks())
+    assert lives[0].close_calls == 1 and lives[0].idle_timer is None
+
 
 
 # ---------------------------------------------------------------- text to speech
@@ -1228,6 +1406,56 @@ def test_tts_errors_and_auth(make):
     locked = make(speaker=speaker, password="secret")
     assert locked.post("/api/tts", json={"text": "x"}).status_code == 401
     assert speaker.texts == []
+
+
+def test_tts_is_synthesized_once_per_text(make, monkeypatch):
+    """Every device reading out a unit asks for the same text: ElevenLabs bills it once."""
+    monkeypatch.setattr(web, "TTS_CACHE_ITEMS", 2)
+    speaker = FakeSpeaker()
+    client = make(speaker=speaker)
+    for text in ("Salom", "Salom", " Salom ", "Xayr", "Salom", "Rahmat", "Xayr"):
+        resp = client.post("/api/tts", json={"text": text})
+        assert resp.status_code == 200 and resp.content == b"ID3-mp3"
+    # the oldest clip makes room for new ones
+    assert speaker.texts == ["Salom", "Xayr", "Rahmat", "Xayr"]
+
+
+def test_tts_concurrent_requests_share_one_synthesis(make):
+    gate, entered = threading.Event(), threading.Event()
+
+    class SlowSpeaker(FakeSpeaker):
+        def synthesize(self, text):
+            entered.set()
+            assert gate.wait(5)
+            return super().synthesize(text)
+
+    speaker = SlowSpeaker()
+    client = make(speaker=speaker)
+    results = []
+
+    def read_out():
+        results.append(client.post("/api/tts", json={"text": "Salom"}).content)
+
+    threads = [threading.Thread(target=read_out) for _ in range(3)]
+    threads[0].start()
+    assert entered.wait(3)
+    for t in threads[1:]:
+        t.start()
+    time.sleep(0.2)  # the others are waiting for the same clip
+    gate.set()
+    for t in threads:
+        t.join(5)
+    assert results == [b"ID3-mp3"] * 3 and speaker.texts == ["Salom"]
+
+
+def test_tts_failure_is_not_cached(make):
+    speaker = FakeSpeaker(fail=True)
+    client = make(speaker=speaker)
+    assert client.post("/api/tts", json={"text": "Salom"}).status_code == 502
+    speaker.fail = False
+    assert client.post("/api/tts", json={"text": "Salom"}).status_code == 200
+    assert speaker.texts == ["Salom"]
+
 
 
 # ---------------------------------------------------------------- HTTPS
@@ -1286,13 +1514,13 @@ def test_rejected_speaker_edit_does_not_keep_the_session_loaded(client, store, s
     add_speaker(store, sid, "S1", "Spiker 1")
     assert client.patch(f"/api/sessions/{sid}/speakers/S9", json={"label": "Ali"}).status_code == 400
     assert client.post(f"/api/sessions/{sid}/speakers/S9/merge", json={"into": "S1"}).status_code == 400
-    wait_for(lambda: all(s.closed for s in lives), timeout=0.5)
+    wait_for(lambda: all(s.close_calls for s in lives), timeout=0.5)
 
 
 def test_delete_closes_the_live_session_on_the_event_loop(client, sid, lives):
     with client.websocket_connect(f"/ws?session={sid}"):
         assert client.delete(f"/api/sessions/{sid}").status_code == 200
-        assert lives[0].closed == 1
+        assert lives[0].close_calls == 1
         assert not lives[0].closed_off_loop
 
 
@@ -1320,5 +1548,5 @@ def test_speaker_order_survives_a_rename(client, store, sid, lives):
     add_speaker(store, sid, "S1", "Spiker 1")
     add_speaker(store, sid, "S2", "Spiker 2")
     assert client.patch(f"/api/sessions/{sid}/speakers/S1", json={"label": "Aziz"}).status_code == 200
-    wait_for(lambda: lives[0].closed == 1)
+    wait_for(lambda: lives[0].close_calls == 1)
     assert [sp["id"] for sp in client.get(f"/api/sessions/{sid}").json()["speakers"]] == ["S1", "S2"]

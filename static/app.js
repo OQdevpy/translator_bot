@@ -1,4 +1,15 @@
-import { Downsampler, SAMPLE_RATE, Segmenter, encodeWav, packSegment } from "./audio.js";
+import { Downsampler, SAMPLE_RATE, Segmenter, encodeWav } from "./audio.js";
+import {
+  Outbox,
+  ReadQueue,
+  captureStalled,
+  findPendingReport,
+  makeClientId,
+  planResync,
+  pollReport,
+  tail,
+  unionUnits,
+} from "./live.js";
 
 const $ = (id) => document.getElementById(id);
 const ui = {
@@ -54,24 +65,41 @@ const store = {
 
 const COLORS = ["#2563eb", "#db2777", "#059669", "#d97706", "#7c3aed", "#0891b2", "#dc2626", "#4d7c0f"];
 const MAX_TURNS_ON_PAGE = 300; // older parts stay in the report
+const MAX_UNITS_KEPT = 1000; // units remembered for redraws and duplicate checks
 const SAME_TURN_GAP_S = 300; // a speaker's units closer than this join one block
-const MAX_REPLAY = 5; // after a reconnect, only the newest unsent phrases are still worth sending
-const MAX_REPLAY_AGE_MS = 30000;
+const LIVE_TEXT_CHARS = 240; // the live strip shows only the newest words
+const PING_MS = 10000;
+const PONG_TIMEOUT_MS = 25000; // no answer for this long: the socket is dead even if it still says OPEN
+const CLIENT_ID = makeClientId();
+const SILENCE = URL.createObjectURL(new Blob([encodeWav(new Float32Array(1600))], { type: "audio/wav" })); // 0.1 s
+const TAP_HINT = "🔊 Ovozli o'qish ishlashi uchun sahifaga bir marta bosing.";
+const STALL_WARNING =
+  "⚠️ Mikrofondan ovoz kelmayapti (qo'ng'iroq, Siri yoki ekran qulfi bo'lishi mumkin). " +
+  "Sahifani ochib qo'ying; tiklanmasa ■ To'xtatish, so'ng ▶ Boshlash tugmasini bosing.";
 
 let config = null;
-let session = null; // {id, title, created_at, partner, notes, units, reports}
+let session = null; // {id, title, created_at, partner, notes, reports, units_on_page}
 const speakers = new Map(); // id -> {id, label, voice}
-const shownUnits = new Set();
+const shown = new Map(); // unit id -> unit, in page order
 let lastTurn = null; // {el, speaker, end}
 let ws = null;
 let reconnectDelay = 1000;
-let capture = null; // {ctx, stream, segmenter, paused, hearsOutput}
+let pingSentAt = null; // oldest unanswered ping on the current socket
+let capture = null; // {ctx, stream, segmenter, paused, hearsOutput, heardAt, stalled, watchdog}
 let seq = 0;
-const outbox = []; // phrases recorded while offline: {frame, at}
-let listening = 0; // phrases sent and not answered yet
+const outbox = new Outbox(); // phrases not acknowledged yet: resent after a reconnect
+let flushOwed = null; // seminar whose stop could not send its flush while offline
+let syncGen = 0; // only the newest re-sync applies its data
+let syncing = null; // what live messages changed while that re-sync was fetching
+let rebuildNext = false; // a requested redraw survives a re-sync that failed or was superseded
+let choosing = null; // the seminar pick in progress
+let deleting = null; // seminar this page is deleting: its 4404 is expected
+let reportWait = null; // {id, sessionId}: the report whose progress is shown
 const player = new Audio();
-const speechQueue = [];
+const readQueue = new ReadQueue();
 let speaking = false;
+let audioBlocked = false; // the browser refused playback: no clips are fetched until a tap
+let unlockSeq = 0;
 let wakeLock = null;
 let editingSpeaker = null;
 
@@ -92,7 +120,9 @@ async function api(path, options = {}) {
     try {
       detail = (await res.json()).detail || detail;
     } catch {}
-    throw new Error(detail);
+    const err = new Error(detail);
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -100,30 +130,62 @@ async function api(path, options = {}) {
 // ---------- session ----------
 
 async function openSession(id) {
-  const data = await api(`/api/sessions/${id}`);
-  session = data;
+  session = { id };
+  outbox.keepOnly(id);
+  speakers.clear();
+  renderUnits([], false);
+  showNotes(null);
+  showPending([], 0);
+  updateHint();
+  // socket first, then the fetch: a unit stored in between still arrives live
+  connect();
+  await resync(true);
   store.set("session", String(id));
+}
+
+/**
+ * Brings the page up to date: broadcasts reach only the sockets connected at that moment,
+ * so after a reconnect (screen lock, Wi-Fi drop, server restart) whatever was said meanwhile is fetched.
+ */
+async function resync(rebuild = false) {
+  const id = session.id;
+  const gen = ++syncGen;
+  const seen = (syncing = { pending: false, notes: false, speakers: new Map() });
+  rebuildNext ||= rebuild;
+  let data;
+  try {
+    data = await api(`/api/sessions/${id}`);
+  } finally {
+    if (syncing === seen) syncing = null;
+  }
+  if (gen !== syncGen || session.id !== id) return; // a newer re-sync or another seminar took over
+  const { units, ...rest } = data;
+  session = { ...session, ...rest };
   ui.title.textContent = data.title;
   document.title = `${data.title} · Jonli tarjimon`;
   ui.partner.value = data.partner;
   speakers.clear();
   data.speakers.forEach((sp) => speakers.set(sp.id, sp));
-  shownUnits.clear();
-  lastTurn = null;
-  ui.transcript.querySelectorAll(".turn, .earlier").forEach((el) => el.remove());
-  if (data.units.length >= data.units_on_page) {
-    // long seminars: only the newest part is on the page, all of it is in the reports
-    ui.transcript.prepend(el("p", "earlier muted", "… avvalgi qismlar 📄 hisobotda"));
+  seen.speakers.forEach((sp) => speakers.set(sp.id, sp)); // arrived after the fetch read them
+  const plan = planResync([...shown.values()], units);
+  if (rebuildNext || plan.rebuild) {
+    rebuildNext = false;
+    renderUnits(unionUnits(units, [...shown.values()], data.units_on_page), units.length >= data.units_on_page);
+  } else {
+    plan.missing.forEach((u) => addUnit(u, false));
   }
-  data.units.forEach((u) => addUnit(u, false));
-  showNotes(data.notes);
-  showPending(data.pending, 0);
-  updatePlaceholder();
-  ui.transcript.scrollTop = ui.transcript.scrollHeight;
-  connect();
+  relabelAll();
+  if (!seen.notes) showNotes(data.notes);
+  if (!seen.pending) showPending(data.pending, data.interpreting ?? 0);
 }
 
-async function chooseInitialSession() {
+function chooseInitialSession() {
+  // the 4404 of a deleted seminar and its caller may both ask: only one pick may run
+  choosing ??= pickSession().finally(() => (choosing = null));
+  return choosing;
+}
+
+async function pickSession() {
   const saved = Number(store.get("session"));
   if (saved) {
     try {
@@ -161,52 +223,89 @@ function setStatus(state, text) {
 
 function connect() {
   if (ws) {
-    ws.onclose = null;
+    ws.onclose = ws.onmessage = null;
     ws.close();
   }
   const sessionId = session.id;
   setStatus("connecting", "Ulanmoqda…");
-  const socket = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?session=${sessionId}`);
+  const socket = new WebSocket(
+    `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws?session=${sessionId}&client=${CLIENT_ID}`,
+  );
   ws = socket;
+  pingSentAt = null;
   socket.binaryType = "arraybuffer";
   socket.onopen = () => {
     reconnectDelay = 1000;
     setStatus("online", "Ulangan");
-    const fresh = outbox.splice(0).filter((item, i, all) => i >= all.length - MAX_REPLAY && Date.now() - item.at < MAX_REPLAY_AGE_MS);
-    fresh.forEach((item) => send(item.frame));
+    const now = Date.now();
+    // the server answers "dup" for phrases it already has
+    outbox.replay(sessionId, now).forEach((item) => socket.send(outbox.frame(item, now)));
+    if (capture?.segmenter.speaking) sendJson({ type: "speech", active: true }, socket);
+    if (flushOwed === sessionId && !capture) sendJson({ type: "flush" }, socket);
+    flushOwed = null;
+    updateHint();
+    const sync = () =>
+      resync().catch(() => setTimeout(() => ws === socket && socket.readyState === WebSocket.OPEN && sync(), 3000));
+    sync();
   };
-  socket.onmessage = (event) => handleMessage(JSON.parse(event.data));
-  socket.onclose = (event) => {
+  socket.onmessage = (event) => {
     if (ws !== socket) return;
-    setStatus("offline", "Aloqa yo'q");
-    listening = 0;
-    if (event.code === 4401) {
-      location.reload(); // session expired: show the login page
+    pingSentAt = null; // anything from the server proves the socket is alive
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
       return;
     }
-    if (event.code === 4403) {
-      showWarning(
-        "Server ulanishni rad etdi: Origin va Host mos emas. nginx bo'lsa, proxy_set_header Host $http_host; qatorini qo'shing.",
-      );
-      return;
-    }
-    if (event.code === 4404) {
-      store.set("session", "");
-      chooseInitialSession();
-      return;
-    }
-    setTimeout(() => {
-      if (ws === socket) connect();
-    }, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+    handleMessage(msg);
   };
+  socket.onclose = (event) => onClosed(socket, sessionId, event.code);
 }
 
-function send(frame) {
-  if (ws?.readyState !== WebSocket.OPEN) return false;
-  ws.send(frame);
-  listening++;
-  updateHint();
+function onClosed(socket, sessionId, code) {
+  if (ws !== socket) return;
+  setStatus("offline", "Aloqa yo'q");
+  if (code === 4401) {
+    location.reload(); // session expired: show the login page
+    return;
+  }
+  if (code === 4403) {
+    showWarning(
+      "Server ulanishni rad etdi: Origin va Host mos emas. nginx bo'lsa, proxy_set_header Host $http_host; qatorini qo'shing.",
+    );
+    return;
+  }
+  if (code === 4404) {
+    if (sessionId === deleting) return; // this page deleted it: the delete handler picks the next seminar
+    store.set("session", "");
+    chooseInitialSession().catch((err) => showWarning(err.message));
+    return;
+  }
+  setTimeout(() => {
+    if (ws === socket) connect();
+  }, reconnectDelay);
+  reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+}
+
+function heartbeat() {
+  const socket = ws;
+  if (socket?.readyState !== WebSocket.OPEN) return;
+  if (pingSentAt !== null && Date.now() - pingSentAt > PONG_TIMEOUT_MS) {
+    // Wi-Fi gone without a close: phrases would keep vanishing into this socket
+    socket.onclose = socket.onmessage = null;
+    socket.close();
+    onClosed(socket, session.id, 1006);
+    return;
+  }
+  pingSentAt ??= Date.now();
+  socket.send(JSON.stringify({ type: "ping" }));
+}
+
+setInterval(heartbeat, PING_MS);
+
+function sendJson(msg, socket = ws) {
+  if (socket?.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(msg));
   return true;
 }
 
@@ -214,30 +313,33 @@ function handleMessage(msg) {
   switch (msg.type) {
     case "heard":
     case "empty":
-      listening = Math.max(0, listening - 1);
+    case "dup":
+      outbox.ack(msg.id);
       updateHint();
       break;
     case "pending":
+      if (syncing) syncing.pending = true;
       showPending(msg.pending, msg.interpreting);
       break;
     case "unit":
       addUnit(msg.unit, true);
       break;
     case "speaker":
+      syncing?.speakers.set(msg.speaker.id, msg.speaker);
       speakers.set(msg.speaker.id, msg.speaker);
       relabel(msg.speaker.id);
       break;
     case "merged":
-      openSession(session.id); // simplest way to regroup the blocks
+      resync(true).catch(() => {}); // simplest way to regroup the blocks; a failed one is redone on the next sync
       break;
     case "notes":
+      if (syncing) syncing.notes = true;
       showNotes(msg.notes);
       break;
     case "error":
-      if (msg.id != null) listening = Math.max(0, listening - 1);
+      if (msg.id != null) outbox.ack(msg.id);
       updateHint();
-      showWarning(msg.message);
-      setTimeout(() => showWarning(""), 6000);
+      flashWarning(msg.message);
       break;
   }
 }
@@ -294,8 +396,9 @@ function newTurn(unit) {
 }
 
 function addUnit(unit, live) {
-  if (shownUnits.has(unit.id)) return;
-  shownUnits.add(unit.id);
+  if (shown.has(unit.id)) return;
+  shown.set(unit.id, unit);
+  if (shown.size > MAX_UNITS_KEPT) shown.delete(shown.keys().next().value);
   const stick = nearBottom();
   if (!lastTurn || lastTurn.speaker !== unit.speaker || unit.start - lastTurn.end > SAME_TURN_GAP_S) {
     lastTurn = { el: newTurn(unit), speaker: unit.speaker, end: unit.end };
@@ -313,9 +416,27 @@ function addUnit(unit, live) {
   if (live && ui.tts.checked && config.tts && unit.translation) speak(unit.translation);
 }
 
+/** Draws the transcript from scratch (opening a seminar, a merge, or units missed out of order). */
+function renderUnits(units, earlier) {
+  const stick = shown.size === 0 || nearBottom();
+  shown.clear();
+  lastTurn = null;
+  ui.transcript.querySelectorAll(".turn, .earlier").forEach((node) => node.remove());
+  // long seminars: only the newest part is on the page, all of it is in the reports
+  if (earlier) ui.transcript.prepend(el("p", "earlier muted", "… avvalgi qismlar 📄 hisobotda"));
+  units.forEach((u) => addUnit(u, false));
+  updatePlaceholder();
+  if (stick) ui.transcript.scrollTop = ui.transcript.scrollHeight;
+}
+
 function relabel(id) {
   ui.transcript.querySelectorAll(`.turn[data-speaker="${CSS.escape(id)}"] .who`).forEach((b) => (b.textContent = labelOf(id)));
   if (ui.liveWho.dataset.speaker === id) ui.liveWho.textContent = labelOf(id);
+}
+
+function relabelAll() {
+  ui.transcript.querySelectorAll(".turn").forEach((turn) => (turn.querySelector(".who").textContent = labelOf(turn.dataset.speaker)));
+  if (ui.liveWho.dataset.speaker) ui.liveWho.textContent = labelOf(ui.liveWho.dataset.speaker);
 }
 
 function showPending(pending, interpreting) {
@@ -325,10 +446,13 @@ function showPending(pending, interpreting) {
     ui.liveWho.dataset.speaker = last.speaker;
     ui.liveWho.textContent = labelOf(last.speaker);
     ui.liveWho.style.setProperty("--c", colorOf(last.speaker));
-    ui.liveText.textContent = `${flagOf(last.lang)} ${pending.filter((p) => p.speaker === last.speaker).map((p) => p.text).join(" ")}`;
+    const text = pending.filter((p) => p.speaker === last.speaker).map((p) => p.text).join(" ");
+    // what is being said now: on a phone only a couple of lines fit, so show the newest words
+    ui.liveText.replaceChildren(el("span", null, `${flagOf(last.lang)} ${tail(text, LIVE_TEXT_CHARS)}`));
   } else {
+    delete ui.liveWho.dataset.speaker;
     ui.liveWho.textContent = "";
-    ui.liveText.textContent = "";
+    ui.liveText.replaceChildren();
   }
   ui.liveBusy.hidden = !interpreting;
 }
@@ -338,14 +462,24 @@ function updatePlaceholder() {
 }
 
 function updateHint() {
-  if (!capture) return;
-  if (capture.paused) return;
-  ui.hint.textContent = listening ? `👂 Eshitilmoqda (${listening})` : "Tinglanmoqda…";
+  if (!capture || capture.paused) return;
+  if (capture.stalled) ui.hint.textContent = "⚠️ Ovoz kelmayapti";
+  else ui.hint.textContent = outbox.size ? `👂 Eshitilmoqda (${outbox.size})` : "Tinglanmoqda…";
 }
 
 function showWarning(text) {
   ui.warning.textContent = text;
   ui.warning.hidden = !text;
+}
+
+/** Clears the warning only if it still shows this text: another one may have replaced it. */
+function clearWarning(text) {
+  if (ui.warning.textContent === text) showWarning("");
+}
+
+function flashWarning(text) {
+  showWarning(text);
+  setTimeout(() => clearWarning(text), 6000);
 }
 
 // ---------- speakers ----------
@@ -381,7 +515,7 @@ ui.speakerMerge.addEventListener("submit", async (event) => {
   try {
     await api(`/api/sessions/${session.id}/speakers/${editingSpeaker}/merge`, { method: "POST", body: { into } });
     ui.speakerDialog.close();
-    await openSession(session.id);
+    await resync(true);
   } catch (err) {
     showWarning(err.message);
   }
@@ -395,6 +529,15 @@ function duration(first, last) {
   return minutes >= 60 ? `${Math.floor(minutes / 60)} soat ${minutes % 60} daq` : `${minutes} daq`;
 }
 
+async function switchSession(id) {
+  if (capture) stop();
+  try {
+    await openSession(id);
+  } catch (err) {
+    showWarning(err.message);
+  }
+}
+
 async function showSessions() {
   const list = await api("/api/sessions");
   ui.sessionsList.replaceChildren(
@@ -406,10 +549,9 @@ async function showSessions() {
         el("b", null, s.title),
         el("span", "muted", `${new Date(s.created_at * 1000).toLocaleString([], { dateStyle: "short", timeStyle: "short" })} · ${s.units} gap · ${duration(s.first, s.last)}`),
       );
-      open.addEventListener("click", async () => {
+      open.addEventListener("click", () => {
         ui.sessionsDialog.close();
-        if (capture) stop();
-        await openSession(s.id);
+        switchSession(s.id);
       });
       const rename = el("button", "icon small", "✏️");
       rename.type = "button";
@@ -424,17 +566,7 @@ async function showSessions() {
       const del = el("button", "icon small", "🗑");
       del.type = "button";
       del.title = "O'chirish";
-      del.addEventListener("click", async () => {
-        if (!confirm(`«${s.title}» va uning barcha tarjimalari, hisobotlari o'chirilsinmi?`)) return;
-        await api(`/api/sessions/${s.id}`, { method: "DELETE" });
-        if (s.id === session.id) {
-          store.set("session", "");
-          ui.sessionsDialog.close();
-          await chooseInitialSession();
-        } else {
-          showSessions();
-        }
-      });
+      del.addEventListener("click", () => deleteSession(s));
       li.append(open, rename, del);
       return li;
     }),
@@ -442,15 +574,46 @@ async function showSessions() {
   if (!ui.sessionsDialog.open) ui.sessionsDialog.showModal();
 }
 
+async function deleteSession(s) {
+  if (!confirm(`«${s.title}» va uning barcha tarjimalari, hisobotlari o'chirilsinmi?`)) return;
+  const current = s.id === session.id;
+  if (current) deleting = s.id; // the server closes our socket with 4404 before it answers
+  try {
+    await api(`/api/sessions/${s.id}`, { method: "DELETE" });
+  } catch (err) {
+    deleting = null;
+    if (current && ws?.readyState === WebSocket.CLOSED) connect();
+    showWarning(err.message);
+    return;
+  }
+  if (!current) {
+    showSessions();
+    return;
+  }
+  if (capture) stop();
+  store.set("session", "");
+  ui.sessionsDialog.close();
+  try {
+    await chooseInitialSession();
+  } catch (err) {
+    showWarning(err.message);
+  } finally {
+    deleting = null;
+  }
+}
+
 ui.sessionsBtn.addEventListener("click", () => showSessions().catch((err) => showWarning(err.message)));
 
 ui.newSession.addEventListener("submit", async (event) => {
   event.preventDefault();
-  const created = await api("/api/sessions", { method: "POST", body: { title: ui.newTitle.value } });
-  ui.newTitle.value = "";
-  ui.sessionsDialog.close();
-  if (capture) stop();
-  await openSession(created.id);
+  try {
+    const created = await api("/api/sessions", { method: "POST", body: { title: ui.newTitle.value } });
+    ui.newTitle.value = "";
+    ui.sessionsDialog.close();
+    await switchSession(created.id);
+  } catch (err) {
+    showWarning(err.message);
+  }
 });
 
 // ---------- reports ----------
@@ -497,13 +660,55 @@ function renderReports(reports) {
   if (!reports.length) ui.reportsList.append(el("li", "muted", "Hali hisobot yo'q"));
 }
 
+async function refreshReports(sessionId) {
+  try {
+    const data = await api(`/api/sessions/${sessionId}`);
+    if (session.id !== sessionId) return;
+    session.reports = data.reports;
+    renderReports(data.reports);
+  } catch {}
+}
+
+/** Shows a report's progress until it is written (a whole day can take a minute or two). */
+async function followReport(id, sessionId, text = "⏳ Hisobot tayyorlanmoqda… (uzun seminar uchun 1–2 daqiqa)") {
+  ui.reportStatus.hidden = false;
+  ui.reportStatus.textContent = text;
+  if (reportWait?.id === id) return; // already being followed: that loop shows the result
+  const job = (reportWait = { id, sessionId });
+  const current = () => reportWait === job && session.id === sessionId;
+  try {
+    const status = await pollReport(() => api(`/api/reports/${id}/status`), {
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    });
+    if (status.status === "failed") throw new Error(status.error || "Hisobot tayyorlab bo'lmadi");
+    if (current()) {
+      ui.reportStatus.textContent = "";
+      const link = el("a", null, "✅ Tayyor — hisobotni ochish");
+      link.href = `/api/reports/${id}`;
+      link.target = "_blank";
+      ui.reportStatus.append(link);
+    }
+  } catch (err) {
+    if (current()) ui.reportStatus.textContent = `⚠️ ${err.message}`;
+  } finally {
+    if (reportWait === job) reportWait = null;
+    refreshReports(sessionId);
+  }
+}
+
 ui.reportBtn.addEventListener("click", async () => {
   try {
-    session = { ...session, ...(await api(`/api/sessions/${session.id}`)) };
+    const { units, ...rest } = await api(`/api/sessions/${session.id}`);
+    session = { ...session, ...rest };
   } catch {}
   setRange("all");
   renderReports(session.reports || []);
-  ui.reportStatus.hidden = true;
+  if (reportWait?.sessionId !== session.id) {
+    ui.reportStatus.hidden = true;
+    // a report still being written (e.g. started before a reload): show its progress, not an empty form
+    const running = (session.reports || []).find((r) => r.status === "pending");
+    if (running) followReport(running.id, session.id);
+  }
   ui.reportDialog.showModal();
 });
 
@@ -512,31 +717,27 @@ ui.reportDialog.querySelectorAll("[data-preset]").forEach((b) => b.addEventListe
 ui.reportMake.addEventListener("click", async () => {
   const start = fromLocalInput(ui.reportStart.value);
   const end = fromLocalInput(ui.reportEnd.value);
+  ui.reportStatus.hidden = false;
   if (start == null || end == null || start >= end) {
-    ui.reportStatus.hidden = false;
     ui.reportStatus.textContent = "Vaqt oralig'ini to'g'ri tanlang";
     return;
   }
+  const sessionId = session.id;
+  // the same expensive report is already being written: follow it instead of starting a second one
+  const running = findPendingReport(session.reports || [], start, end);
+  if (running) {
+    followReport(running.id, sessionId, "⏳ Bu oraliq uchun hisobot allaqachon tayyorlanmoqda…");
+    return;
+  }
   ui.reportMake.disabled = true;
-  ui.reportStatus.hidden = false;
   ui.reportStatus.textContent = "⏳ Hisobot tayyorlanmoqda… (uzun seminar uchun 1–2 daqiqa)";
   try {
-    const { id } = await api(`/api/sessions/${session.id}/reports`, { method: "POST", body: { start, end } });
-    let status = { status: "pending" };
-    while (status.status === "pending") {
-      // written in the background: a whole day can take a minute or two
-      await new Promise((resolve) => setTimeout(resolve, 2000));
-      status = await api(`/api/reports/${id}/status`);
+    const { id } = await api(`/api/sessions/${sessionId}/reports`, { method: "POST", body: { start, end } });
+    if (session.id === sessionId) {
+      session.reports = [{ id, start, end, status: "pending", created_at: Date.now() / 1000 }, ...(session.reports || [])];
+      renderReports(session.reports);
     }
-    const data = await api(`/api/sessions/${session.id}`);
-    session.reports = data.reports;
-    renderReports(data.reports);
-    if (status.status === "failed") throw new Error(status.error);
-    ui.reportStatus.textContent = "";
-    const link = el("a", null, "✅ Tayyor — hisobotni ochish");
-    link.href = `/api/reports/${id}`;
-    link.target = "_blank";
-    ui.reportStatus.append(link);
+    followReport(id, sessionId);
   } catch (err) {
     ui.reportStatus.textContent = `⚠️ ${err.message}`;
   } finally {
@@ -547,15 +748,16 @@ ui.reportMake.addEventListener("click", async () => {
 // ---------- audio capture ----------
 
 function onSegment(samples) {
-  const frame = packSegment(++seq, encodeWav(samples, SAMPLE_RATE), Date.now() / 1000);
-  if (!send(frame)) {
-    outbox.push({ frame, at: Date.now() });
-    outbox.splice(0, Math.max(0, outbox.length - MAX_REPLAY)); // keep memory bounded while offline
-  }
+  const item = outbox.add({ id: ++seq, sessionId: session?.id, wav: encodeWav(samples, SAMPLE_RATE), endedAt: Date.now() });
+  // kept until the server acknowledges it: a socket can die with the phrase still in its buffer
+  if (ws?.readyState === WebSocket.OPEN) ws.send(outbox.frame(item, Date.now()));
+  updateHint();
 }
 
 function onSpeech(active) {
   ui.level.classList.toggle("speaking", active);
+  // while someone is talking the server waits with interpreting an unfinished thought
+  sendJson({ type: "speech", active });
 }
 
 async function openStream() {
@@ -581,8 +783,7 @@ async function start() {
   showWarning("");
   // Created inside the click so mobile browsers allow audio.
   const ctx = new AudioContext();
-  player.src = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=";
-  player.play().catch(() => {});
+  unlockAudio();
   let stream = null;
   try {
     if (!ctx.audioWorklet) throw new Error("Brauzer eskirgan: AudioWorklet yo'q. Chrome, Edge, Firefox yoki Safari 14.5+ dan foydalaning.");
@@ -600,13 +801,25 @@ async function start() {
     // A captured browser tab contains only that tab's audio, so our read-out can't leak into it.
     const surface = stream.getVideoTracks()[0]?.getSettings().displaySurface;
     const hearsOutput = ui.source.value !== "tab" || surface !== "browser";
-    capture = { ctx, stream, segmenter, paused: false, hearsOutput };
+    const c = { ctx, stream, segmenter, paused: false, hearsOutput, heardAt: performance.now(), stalled: false, watchdog: null };
+    capture = c;
     const down = new Downsampler(ctx.sampleRate, (frame) => {
-      if (capture && !capture.paused) segmenter.push(frame);
+      if (capture === c && !c.paused) segmenter.push(frame);
     });
-    node.port.onmessage = (event) => down.push(event.data);
+    node.port.onmessage = (event) => {
+      c.heardAt = performance.now();
+      down.push(event.data);
+    };
     stream.getTracks().forEach((t) => t.addEventListener("ended", stop));
+    // iOS suspends capture for a call, Siri or a locked screen and may not resume it by itself
+    stream.getAudioTracks().forEach((t) => {
+      t.addEventListener("mute", () => checkCapture(c));
+      t.addEventListener("unmute", () => checkCapture(c));
+    });
     await ctx.resume();
+    c.heardAt = performance.now();
+    ctx.onstatechange = () => checkCapture(c);
+    c.watchdog = setInterval(() => checkCapture(c), 1000);
 
     ui.toggle.dataset.state = "running";
     ui.toggle.textContent = "■ To'xtatish";
@@ -627,22 +840,47 @@ async function start() {
 function stop() {
   if (!capture) return;
   const c = capture;
+  const socket = ws; // the seminar being stopped, even if the page switches to another one right after
   c.segmenter.flush();
   capture = null;
+  clearInterval(c.watchdog);
   c.stream.getTracks().forEach((t) => t.stop());
   c.ctx.close();
+  clearWarning(STALL_WARNING);
   wakeLock?.release().catch(() => {});
   wakeLock = null;
-  // interpret what was said up to now instead of waiting for more speech
-  setTimeout(() => {
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "flush" }));
-  }, 2500);
+  // interpret what is left: the server waits until the phrases sent so far are processed
+  if (!sendJson({ type: "flush" }, socket)) flushOwed = session.id;
   ui.toggle.dataset.state = "idle";
   ui.toggle.textContent = "▶ Boshlash";
   ui.hint.textContent = "Tayyor";
   ui.source.disabled = false;
   ui.level.style.width = "0";
   ui.level.classList.remove("speaking");
+}
+
+/** Notices capture that stopped without an "ended" event, and keeps trying to resume it. */
+function checkCapture(c) {
+  if (capture !== c) return;
+  if (c.ctx.state !== "running") c.ctx.resume().catch(() => {});
+  if (c.paused) return; // muted for our read-out: no phrases expected
+  const stalled = captureStalled({
+    state: c.ctx.state,
+    muted: c.stream.getAudioTracks()[0]?.muted,
+    silentMs: performance.now() - c.heardAt,
+  });
+  if (stalled === c.stalled) return;
+  c.stalled = stalled;
+  if (stalled) {
+    // end the phrase in progress: the server must not wait for speech that is not coming,
+    // and the audio that comes back may start mid-word
+    c.segmenter.flush();
+    c.segmenter.requireSilence(300);
+    showWarning(STALL_WARNING);
+  } else {
+    clearWarning(STALL_WARNING);
+  }
+  updateHint();
 }
 
 function micError(err) {
@@ -653,7 +891,7 @@ function micError(err) {
 
 function drawLevel() {
   if (!capture) return;
-  const level = capture.paused ? 0 : capture.segmenter.level;
+  const level = capture.paused || capture.stalled ? 0 : capture.segmenter.level;
   const db = 20 * Math.log10(level + 1e-9);
   ui.level.style.width = `${Math.max(0, Math.min(100, ((db + 60) / 60) * 100))}%`;
   requestAnimationFrame(drawLevel);
@@ -666,18 +904,69 @@ async function keepAwake() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (capture && document.visibilityState === "visible") keepAwake();
+  if (document.visibilityState !== "visible") return;
+  if (capture) {
+    keepAwake();
+    if (capture.ctx.state !== "running") capture.ctx.resume().catch(() => {});
+  }
+  // back from a locked screen: reconnect now instead of waiting out the backoff,
+  // and probe a socket that may only look open
+  if (session && ws?.readyState === WebSocket.CLOSED) connect();
+  else heartbeat();
+});
+
+window.addEventListener("beforeunload", (event) => {
+  // a pull-to-refresh or a stray swipe would silently end the recording
+  if (!capture) return;
+  event.preventDefault();
+  event.returnValue = "";
 });
 
 // ---------- voice output ----------
 
+/** Phones start audio only inside a tap: play a silent clip and remember whether the browser allowed it. */
+async function unlockAudio() {
+  if (!player.paused) return; // already playing, so already allowed
+  const n = ++unlockSeq;
+  player.src = SILENCE;
+  let ok = true;
+  try {
+    await player.play();
+  } catch (err) {
+    ok = err?.name !== "NotAllowedError";
+  }
+  if (n !== unlockSeq) return; // a newer attempt (the next event of the same tap) decides
+  if (ok) {
+    audioBlocked = false;
+    clearWarning(TAP_HINT);
+  } else if (ui.tts.checked) {
+    blockAudio();
+  }
+}
+
+function blockAudio() {
+  // don't synthesize (and pay for) clips nobody can hear until the page is tapped
+  audioBlocked = true;
+  readQueue.clear();
+  showWarning(TAP_HINT);
+}
+
+function onGesture() {
+  if (capture && capture.ctx.state !== "running") capture.ctx.resume().catch(() => {});
+  if (audioBlocked && ui.tts.checked) unlockAudio();
+}
+
+// which event counts as a user gesture differs between mouse, touch and browsers
+["pointerdown", "pointerup", "click", "keydown"].forEach((type) => document.addEventListener(type, onGesture, true));
+
 function speak(text) {
-  speechQueue.push(text);
+  if (audioBlocked) return;
+  readQueue.push(text, Date.now());
   if (!speaking) playNext();
 }
 
 async function playNext() {
-  const text = speechQueue.shift();
+  const text = readQueue.next(Date.now());
   if (text === undefined) {
     speaking = false;
     return;
@@ -703,12 +992,15 @@ async function playNext() {
         }
       }
       // no early return here: playNext() below must run to clear `speaking`
-      if (ui.tts.checked) {
+      if (ui.tts.checked && !audioBlocked) {
         player.src = url;
         await new Promise((resolve) => {
           // "pause" too: switching read-out off stops the clip without an "ended" event
           player.onended = player.onerror = player.onpause = resolve;
-          player.play().catch(resolve);
+          player.play().catch((err) => {
+            if (err?.name === "NotAllowedError") blockAudio();
+            resolve();
+          });
         });
       }
     } finally {
@@ -755,9 +1047,12 @@ ui.showSrc.addEventListener("change", () => {
 
 ui.tts.addEventListener("change", () => {
   store.set("tts", ui.tts.checked ? "1" : "0");
-  if (!ui.tts.checked) {
-    speechQueue.length = 0;
+  if (ui.tts.checked) {
+    unlockAudio(); // this tap is the moment a phone lets the page start audio
+  } else {
+    readQueue.clear();
     player.pause();
+    clearWarning(TAP_HINT);
   }
 });
 
@@ -788,6 +1083,8 @@ async function init() {
   }
   ui.ttsLabel.hidden = !config.tts;
   ui.tts.checked = config.tts && store.get("tts") === "1";
+  // restored without a tap: works where autoplay is allowed, otherwise asks for one
+  if (ui.tts.checked) unlockAudio();
   ui.showSrc.checked = store.get("showSrc") === "1";
   document.body.classList.toggle("show-src", ui.showSrc.checked);
   ui.logout.hidden = !config.auth;

@@ -12,9 +12,11 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import struct
 import time
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -45,7 +47,7 @@ STATIC_DIR = Path(__file__).parent / "static"
 COOKIE = "stt_session"
 MAX_SEGMENT_BYTES = 2_000_000  # ~60 s of 16 kHz 16-bit mono WAV
 MAX_TTS_CHARS = 1000
-MAX_QUEUED_SEGMENTS = 20  # per session; protects the API budget from a runaway client
+TTS_CACHE_ITEMS = 100  # recent read-outs kept: every device reading out a unit gets the same clip
 UNITS_ON_PAGE = 400  # older parts stay in the database and the reports
 SESSION_SECONDS = 30 * 24 * 3600
 LOGIN_FREE_FAILS = 5  # wrong passwords per IP before it is locked out
@@ -53,7 +55,9 @@ LOGIN_LOCK_SECONDS = 60  # doubles with every further failure
 LOGIN_LOCK_MAX = 3600
 LOGIN_FAIL_DELAY = 1.0  # seconds; slows down guessing without holding a worker thread
 UNLOAD_CHECK_SECONDS = 5.0
-MAX_CLOCK_SKEW = 24 * 3600  # browser timestamps further off than this are ignored
+UNLOAD_GRACE_SECONDS = 90.0  # a phone back on the Wi-Fi within this finds the session as it left it
+MAX_FRAME_AGE = 24 * 3600  # a phrase "older" than this is a broken client: it gets the arrival time
+CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,40}")  # one per page load, so resent phrases are recognised
 
 log = logging.getLogger("stt_web")
 
@@ -143,14 +147,36 @@ def create_app(
         return live[session_id]
 
     async def unload_when_idle(sess: LiveSession):
-        """Keeps the session in memory until nobody is connected and its work is done."""
-        while not sess.clients:
-            if not sess.busy() and sess.idle_timer is None:
+        """Keeps the session in memory while anyone is connected, its work is unfinished, or for a grace
+        period after the last client left (a reload loses the dedupe of resent phrases and the timing)."""
+        while not sess.clients and not sess.closed:
+            if not sess.busy() and sess.idle_timer is None and time.monotonic() - sess.idle_since >= UNLOAD_GRACE_SECONDS:
                 sess.close()
                 if live.get(sess.id) is sess:
                     live.pop(sess.id)
                 return
             await asyncio.sleep(UNLOAD_CHECK_SECONDS)
+
+    tts_cache: OrderedDict[str, bytes] = OrderedDict()  # text -> MP3, least recently used first
+    tts_jobs: dict[str, asyncio.Task] = {}  # syntheses in progress: concurrent requests share one
+
+    async def synthesize(text: str) -> bytes:
+        if text in tts_cache:
+            tts_cache.move_to_end(text)
+            return tts_cache[text]
+
+        async def run():
+            audio = await asyncio.to_thread(speaker.synthesize, text)
+            tts_cache[text] = audio
+            while len(tts_cache) > TTS_CACHE_ITEMS:
+                tts_cache.popitem(last=False)
+            return audio
+
+        job = tts_jobs.get(text)
+        if job is None:
+            job = tts_jobs[text] = asyncio.create_task(run())
+            job.add_done_callback(lambda _: tts_jobs.pop(text, None))
+        return await asyncio.shield(job)  # a device giving up must not cancel the others' read-out
 
     @app.get("/healthz")
     def healthz():
@@ -217,7 +243,7 @@ def create_app(
         if not text or len(text) > MAX_TTS_CHARS:
             raise HTTPException(400, f"text must be 1..{MAX_TTS_CHARS} characters")
         try:
-            audio = await asyncio.to_thread(speaker.synthesize, text)
+            audio = await synthesize(text)
         except Exception:
             log.exception("TTS failed")
             raise HTTPException(502, "TTS failed")
@@ -234,7 +260,8 @@ def create_app(
     def create_session(body: NewSession, request: Request):
         require_auth(request)
         title = body.title.strip()[:200] or f"Seminar {datetime.now(tz):%d.%m.%Y %H:%M}"
-        return store.create_session(title)
+        row = store.create_session(title)
+        return {key: row[key] for key in ("id", "title", "created_at", "partner", "notes")}
 
     @app.get("/api/sessions/{session_id}")
     def get_session(session_id: int, request: Request):
@@ -253,6 +280,7 @@ def create_app(
             "units": store.units(session_id, limit=UNITS_ON_PAGE),
             "units_on_page": UNITS_ON_PAGE,
             "pending": [{"speaker": p["speaker"], "lang": p["lang"], "text": p["text"]} for p in pending],
+            "interpreting": sess.interpreting_count() if sess else 0,
             "reports": store.reports(session_id),
         }
 
@@ -349,8 +377,7 @@ def create_app(
             raise HTTPException(409, row["error"] or "Hisobot hali tayyor emas")
         session = store.session(row["session_id"])
         units = store.units(row["session_id"], row["start"], row["end"])
-        speakers = {sp["id"]: sp["label"] for sp in store.speakers(row["session_id"])}
-        return row, session, units, speakers
+        return row, session, units, store.speaker_labels(row["session_id"])
 
     @app.get("/api/reports/{report_id:int}.md")
     def report_markdown(report_id: int, request: Request):
@@ -376,8 +403,7 @@ def create_app(
         require_auth(request)
         row = session_or_404(session_id)
         units = store.units(session_id, start, end)
-        speakers = {sp["id"]: sp["label"] for sp in store.speakers(session_id)}
-        text = f"{row['title']}\n\n" + report.transcript_text(units, speakers, tz)
+        text = f"{row['title']}\n\n" + report.transcript_text(units, store.speaker_labels(session_id), tz)
         return PlainTextResponse(
             text, headers={"Content-Disposition": f'attachment; filename="transkript-{session_id}.txt"'}
         )
@@ -398,8 +424,11 @@ def create_app(
         if not session_id.isdigit() or len(session_id) > 18 or store.session(int(session_id)) is None:
             await ws.close(code=4404)
             return
+        client = ws.query_params.get("client", "")
+        if not CLIENT_ID.fullmatch(client):
+            client = ""  # still works, only resent phrases can't be recognised
         sess = get_live(int(session_id))
-        sess.clients.add(ws)
+        sess.join(ws)
         try:
             while True:
                 message = await ws.receive()
@@ -407,21 +436,25 @@ def create_app(
                     break
                 if message.get("bytes") is not None:
                     data = message["bytes"]
-                    # frame: 4-byte big-endian segment id, 8-byte capture end time, WAV file
+                    # frame: 4-byte big-endian phrase id, 8-byte float seconds since the phrase ended, WAV file
                     if len(data) < 56 or data[12:16] != b"RIFF" or data[20:24] != b"WAVE":
                         await ws.send_json({"type": "error", "id": None, "message": "Noto'g'ri audio"})
                         continue
-                    seg_id, ended_at = struct.unpack(">Id", data[:12])
+                    seg_id, age = struct.unpack(">Id", data[:12])
+                    if sess.received_before(client, seg_id):  # its acknowledgement was lost in a reconnect
+                        await ws.send_json({"type": "dup", "id": seg_id})
+                        continue
                     if len(data) > MAX_SEGMENT_BYTES:
                         await ws.send_json({"type": "error", "id": seg_id, "message": "Segment juda uzun"})
                         continue
-                    if sess.listen_queue.qsize() >= MAX_QUEUED_SEGMENTS:
+                    if sess.queue_full():
                         await ws.send_json({"type": "error", "id": seg_id, "message": "Navbat to'lib ketdi"})
                         continue
                     now = time.time()
-                    # the browser's clock keeps the timeline right for phrases sent late after a reconnect
-                    received = ended_at if now - MAX_CLOCK_SKEW < ended_at < now + 60 else now
-                    await sess.add_audio(seg_id, data[12:], received)
+                    # the age, not the device's clock: a skewed clock can't misplace the phrase, and one
+                    # resent after a reconnect keeps its place in the timeline
+                    received = now - age if 0 <= age <= MAX_FRAME_AGE else now
+                    await sess.add_audio(seg_id, data[12:], received, origin=ws, client=client)
                 elif message.get("text") is not None:
                     try:
                         msg = json.loads(message["text"])
@@ -429,14 +462,19 @@ def create_app(
                         continue
                     if not isinstance(msg, dict):
                         continue
-                    if msg.get("type") == "partner" and msg.get("partner") in [KEEP_UZBEK, *PARTNER_LANGS]:
+                    kind = msg.get("type")
+                    if kind == "partner" and msg.get("partner") in [KEEP_UZBEK, *PARTNER_LANGS]:
                         sess.set_partner(msg["partner"])
-                    elif msg.get("type") == "flush":
-                        sess.flush()  # listening stopped: interpret what was said so far
+                    elif kind == "speech":
+                        sess.set_speaking(ws, msg.get("active") is True)
+                    elif kind == "flush":
+                        sess.request_flush()  # listening stopped: interpret the rest once it is transcribed
+                    elif kind == "ping":
+                        await ws.send_json({"type": "pong"})
         except WebSocketDisconnect:
             pass
         finally:
-            sess.clients.discard(ws)
+            sess.leave(ws)
             if not sess.clients:
                 asyncio.create_task(unload_when_idle(sess))
 

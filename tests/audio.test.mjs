@@ -13,6 +13,18 @@ import {
   packSegment,
   rms,
 } from "../static/audio.js";
+import {
+  OUTBOX_MAX,
+  Outbox,
+  ReadQueue,
+  captureStalled,
+  findPendingReport,
+  makeClientId,
+  planResync,
+  pollReport,
+  tail,
+  unionUnits,
+} from "../static/live.js";
 
 const FRAME_MS = (FRAME / SAMPLE_RATE) * 1000;
 
@@ -195,12 +207,13 @@ test("encodeWav writes a valid 16-bit mono header and clamps samples", () => {
   assert.deepEqual(pcm, [0, 32767, -32768, 32767, -32768, 16383]);
 });
 
-test("packSegment prefixes a big-endian id and the capture time", () => {
-  const frame = packSegment(258, new Uint8Array([82, 73, 70, 70]).buffer, 1760000000.5);
+test("packSegment prefixes a big-endian id and the phrase's age in seconds", () => {
+  const frame = packSegment(258, new Uint8Array([82, 73, 70, 70]).buffer, 2.5);
   const view = new DataView(frame.buffer);
   assert.equal(view.getUint32(0, false), 258);
-  assert.equal(view.getFloat64(4, false), 1760000000.5);
+  assert.equal(view.getFloat64(4, false), 2.5);
   assert.deepEqual([...frame.slice(12)], [82, 73, 70, 70]);
+  assert.equal(new DataView(packSegment(1, new ArrayBuffer(0)).buffer).getFloat64(4, false), 0);
 });
 
 test("a short word followed by a sub-second pause stays with the next phrase", () => {
@@ -210,4 +223,184 @@ test("a short word followed by a sub-second pause stays with the next phrase", (
   // but a real pause still separates them
   const apart = run(join(noise(500, 0.002), speech(700), noise(1400, 0.002), speech(2000), noise(1500, 0.002)));
   assert.equal(apart.segments.length, 2);
+});
+
+// ---------------------------------------------------------------- live.js
+
+const wav = (n) => new Uint8Array([n]).buffer;
+const frameAge = (frame) => new DataView(frame.buffer).getFloat64(4, false);
+const frameId = (frame) => new DataView(frame.buffer).getUint32(0, false);
+
+test("client id is random and fits the server's [A-Za-z0-9_-]{1,40}", () => {
+  const a = makeClientId();
+  assert.match(a, /^[A-Za-z0-9_-]{1,40}$/);
+  assert.notEqual(a, makeClientId());
+});
+
+test("outbox keeps phrases until the server acknowledges them", () => {
+  const box = new Outbox();
+  box.add({ id: 1, sessionId: 7, wav: wav(1), endedAt: 1000 });
+  box.add({ id: 2, sessionId: 7, wav: wav(2), endedAt: 2000 });
+  assert.equal(box.size, 2);
+  assert.equal(box.ack(1), true);
+  assert.equal(box.ack(1), false); // a second reply, or another page's id: nothing to do
+  assert.equal(box.ack(99), false);
+  assert.deepEqual(box.replay(7, 3000).map((i) => i.id), [2]);
+});
+
+test("outbox resends after a reconnect with the age recomputed at send time", () => {
+  const box = new Outbox();
+  const item = box.add({ id: 5, sessionId: 7, wav: wav(9), endedAt: 10_000 });
+  assert.equal(frameAge(box.frame(item, 10_500)), 0.5);
+  const [again] = box.replay(7, 40_000);
+  const frame = box.frame(again, 40_000);
+  assert.equal(frameId(frame), 5);
+  assert.equal(frameAge(frame), 30);
+  assert.deepEqual([...frame.slice(12)], [9]);
+  assert.equal(frameAge(box.frame(item, 9_000)), 0); // a clock step back never gives a negative age
+});
+
+test("outbox drops phrases older than a minute and keeps at most the newest ten", () => {
+  const box = new Outbox();
+  for (let id = 1; id <= OUTBOX_MAX + 3; id++) box.add({ id, sessionId: 7, wav: wav(id), endedAt: id * 1000 });
+  assert.equal(box.size, OUTBOX_MAX);
+  assert.deepEqual(box.replay(7, 13_000).map((i) => i.id), [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  assert.deepEqual(box.replay(7, 70_500).map((i) => i.id), [11, 12, 13]);
+  assert.equal(box.size, 3);
+});
+
+test("outbox never replays one seminar's phrases into another", () => {
+  const box = new Outbox();
+  box.add({ id: 1, sessionId: 7, wav: wav(1), endedAt: 1000 });
+  box.add({ id: 2, sessionId: 8, wav: wav(2), endedAt: 1000 });
+  assert.deepEqual(box.replay(8, 2000).map((i) => i.id), [2]);
+  box.keepOnly(8); // switching seminars
+  assert.deepEqual(box.items.map((i) => i.id), [2]);
+  box.keepOnly(9);
+  assert.equal(box.size, 0);
+});
+
+const unit = (id, start, speaker = "S1") => ({ id, start, end: start + 5, speaker });
+
+test("re-sync appends units missed while offline when they are newer than the page", () => {
+  const shown = [unit(1, 100), unit(2, 110)];
+  const plan = planResync(shown, [unit(1, 100), unit(2, 110), unit(4, 130), unit(3, 120)]);
+  assert.deepEqual(plan.missing.map((u) => u.id), [3, 4]);
+  assert.equal(plan.rebuild, false);
+  assert.deepEqual(planResync(shown, shown), { missing: [], rebuild: false });
+  assert.deepEqual(planResync([], [unit(1, 100)]).missing.map((u) => u.id), [1]);
+});
+
+test("re-sync redraws when a missed unit belongs before what is shown", () => {
+  // another device's phrase, resent late, was interpreted after ours
+  const plan = planResync([unit(1, 100), unit(3, 130)], [unit(1, 100), unit(2, 110), unit(3, 130)]);
+  assert.deepEqual(plan.missing.map((u) => u.id), [2]);
+  assert.equal(plan.rebuild, true);
+});
+
+test("re-sync redraws when a merge on another device changed shown units' speaker", () => {
+  const plan = planResync([unit(1, 100, "S3"), unit(2, 110, "S1")], [unit(1, 100, "S1"), unit(2, 110, "S1")]);
+  assert.deepEqual(plan.missing, []);
+  assert.equal(plan.rebuild, true);
+});
+
+test("redraw keeps units that arrived live after the fetch read the database", () => {
+  const fetched = [unit(2, 110, "S1"), unit(3, 120, "S1")];
+  const shown = [unit(1, 100, "S3"), unit(2, 110, "S3"), unit(4, 125, "S1")];
+  // 1 is older than the fetched page and has the stale speaker: dropped; 4 arrived after the fetch: kept
+  assert.deepEqual(unionUnits(fetched, shown).map((u) => [u.id, u.speaker]), [[2, "S1"], [3, "S1"], [4, "S1"]]);
+  assert.deepEqual(unionUnits(fetched, shown, 2).map((u) => u.id), [3, 4]);
+  assert.deepEqual(unionUnits([], [unit(5, 1)]).map((u) => u.id), [5]); // opening: only live units so far
+});
+
+test("the live strip shows the end of a long thought, cut at a word", () => {
+  assert.equal(tail("short text", 40), "short text");
+  const long = Array.from({ length: 60 }, (_, i) => `word${i}`).join(" ");
+  const out = tail(long, 50);
+  assert.ok(out.startsWith("…word"), out);
+  assert.ok(out.endsWith("word59"));
+  assert.ok(out.length <= 51);
+  assert.equal(tail("x".repeat(100), 10), `…${"x".repeat(10)}`); // no space: plain cut
+});
+
+test("read-out keeps only the newest three texts", () => {
+  const q = new ReadQueue();
+  ["a", "b", "c", "d", "e"].forEach((t, i) => q.push(t, i));
+  assert.equal(q.size, 3);
+  assert.deepEqual([q.next(10), q.next(10), q.next(10), q.next(10)], ["c", "d", "e", undefined]);
+});
+
+test("read-out skips texts older than a minute", () => {
+  const q = new ReadQueue();
+  q.push("old", 0);
+  q.push("new", 50_000);
+  assert.equal(q.next(61_000), "new");
+  q.push("x", 0);
+  q.clear();
+  assert.equal(q.next(1), undefined);
+});
+
+test("a pending report for about the same range is reused, not started again", () => {
+  const reports = [
+    { id: 1, status: "done", start: 0, end: 3600 },
+    { id: 2, status: "pending", start: 0, end: 3600 },
+    { id: 3, status: "pending", start: 1800, end: 3600 },
+  ];
+  assert.equal(findPendingReport(reports, 0, 3600)?.id, 2);
+  assert.equal(findPendingReport(reports, 0, 3720)?.id, 2); // "whole seminar" pressed two minutes later
+  assert.equal(findPendingReport(reports, 0, 7200), null);
+  assert.equal(findPendingReport(reports, 600, 3600), null);
+  assert.equal(findPendingReport([{ id: 1, status: "failed", start: 0, end: 3600 }], 0, 3600), null);
+});
+
+function statusSource(results) {
+  const calls = [];
+  const sleeps = [];
+  return {
+    calls,
+    sleeps,
+    get: async () => {
+      const next = results[calls.length];
+      calls.push(next);
+      if (next instanceof Error) throw next;
+      return next;
+    },
+    sleep: async (ms) => sleeps.push(ms),
+  };
+}
+
+const httpError = (status) => Object.assign(new Error(`${status}`), { status });
+
+test("report polling retries network blips and 5xx with backoff", async () => {
+  const src = statusSource([
+    { status: "pending" },
+    new TypeError("Failed to fetch"),
+    httpError(502),
+    { status: "pending" },
+    { status: "done" },
+  ]);
+  const status = await pollReport(src.get, { sleep: src.sleep });
+  assert.equal(status.status, "done");
+  assert.deepEqual(src.sleeps, [2000, 2000, 4000, 8000, 2000]);
+});
+
+test("report polling backoff is capped", async () => {
+  const src = statusSource([...Array(8).fill(httpError(503)), { status: "failed", error: "x" }]);
+  const status = await pollReport(src.get, { sleep: src.sleep, maxDelay: 10000 });
+  assert.equal(status.status, "failed"); // a failed job ends the wait with its error
+  assert.equal(Math.max(...src.sleeps), 10000);
+});
+
+test("report polling stops on 404", async () => {
+  const src = statusSource([{ status: "pending" }, httpError(404), { status: "done" }]);
+  await assert.rejects(pollReport(src.get, { sleep: src.sleep }), (err) => err.status === 404);
+  assert.equal(src.calls.length, 2);
+});
+
+test("capture counts as stalled when the context stops, the track is muted or no audio arrives", () => {
+  assert.equal(captureStalled({ state: "running", muted: false, silentMs: 100 }), false);
+  assert.equal(captureStalled({ state: "interrupted", muted: false, silentMs: 0 }), true); // iOS call or Siri
+  assert.equal(captureStalled({ state: "suspended", muted: false, silentMs: 0 }), true);
+  assert.equal(captureStalled({ state: "running", muted: true, silentMs: 0 }), true);
+  assert.equal(captureStalled({ state: "running", muted: undefined, silentMs: 3500 }), true);
 });
