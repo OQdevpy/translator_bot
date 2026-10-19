@@ -1,13 +1,50 @@
-# Tarjimon: Telegram bot + jonli tarjima sayti
+# Tarjimon: Telegram bot + seminar tarjimoni sayti
 
-Ikkala qism ham bir xil tarjima yadrosini (`translator.py`) ishlatadi. Gemini nutq tilini o'zi aniqlaydi.
-Boshqa tildagi gap o'zbekchaga, o'zbekcha gap esa tanlangan tilga (xitoy, turk, ingliz, rus) tarjima qilinadi.
-Gemini oxirgi gaplarni kontekst sifatida ko'radi.
-
-- **`bot.py`**: Telegram bot. Ovozli yoki matnli xabarga tarjimani matn va ovoz (ElevenLabs) ko'rinishida qaytaradi.
+- **`bot.py`**: Telegram bot. Ovozli yoki matnli xabarning tilini aniqlaydi. Boshqa tillar o'zbekchaga, o'zbekcha esa
+  tanlangan tilga (xitoy, turk, ingliz, rus) tarjima qilinadi. Javob matn va ovoz (ElevenLabs) ko'rinishida keladi.
   Admin uchun `/usage` buyrug'i bor va har kuni kechqurun xarajat hisoboti yuboriladi.
-- **`web.py`**: jonli tarjima sayti. Brauzer mikrofon (yoki tab/video) ovozini pauzalarda bo'lib WebSocket orqali yuboradi.
-  Har bir gapning tarjimasi taxminan 2 soniyada ekranda chiqadi. Hammasi bitta portda ishlaydi.
+- **`web.py`**: seminar va uchrashuvlar uchun jonli tarjimon (pastda batafsil). Hammasi bitta portda ishlaydi.
+
+## Seminar tarjimoni qanday ishlaydi
+
+Sayt tarjimon ishlaydigan tamoyil asosida qurilgan: avval eshitadi, fikr tugaganda tushunarli qilib yetkazadi.
+
+1. **Eshitish.** Brauzer mikrofon (yoki tab/video) ovozini pauzalarda iboralarga bo'lib serverga yuboradi.
+   Gemini har bir iborani asl tilida matnga aylantiradi.
+2. **Kim gapiryapti.** Har bir spikerning ovoz izi saqlanadi (WeSpeaker ResNet34 modeli, `voiceprint.py`).
+   - Yangi ibora ovoz izi bo'yicha va kontekst bo'yicha solishtiriladi. Kontekst Gemini'ning ovoz taqqoslashidan
+     hamda kim kimga so'z bergani yoki kim kimga ismini aytib murojaat qilganidan iborat.
+   - Ism aytilsa, spikerga avtomatik qo'yiladi.
+   - Nomni bosib o'zgartirish yoki ikki spikerni birlashtirish mumkin.
+3. **Tarjima.** Fikr tugagach (yoki spiker almashganda), butun fikr professional tarjimon kabi tarjima qilinadi.
+   - Tarjima so'zma-so'z emas, ma'no bo'yicha, tushunarli o'zbek tilida chiqadi.
+   - Oldingi gaplar, seminar mazmuni va atamalar lug'ati hisobga olinadi.
+   - Kerak bo'lsa, qisqa izoh qo'shiladi.
+4. **Kontekst.** Seminar davomida qisqa mazmun va atamalar lug'ati yuritib boriladi. Bu nomlar va terminlarning
+   izchil tarjima qilinishi uchun kerak.
+5. **Hisobot.** 📄 tugmasi bilan istalgan vaqt oralig'i uchun (butun seminar, oxirgi 1 soat, aniq soatlar)
+   hisobot tayyorlanadi. Unda quyidagilar bo'ladi:
+   - umumiy mazmun;
+   - har bir spiker nima degani;
+   - xronologiya;
+   - mavzular;
+   - savol-javoblar;
+   - qarorlar va vazifalar;
+   - atamalar lug'ati;
+   - vaqt va spikerlar bilan to'liq transkript.
+
+   Hisobotni chop etish (PDF) yoki Markdown ko'rinishida yuklab olish mumkin.
+
+Hammasi `data/seminars.db` faylida saqlanadi, shuning uchun sayt kun bo'yi ishlashi mumkin. Seminarlar ro'yxati
+sarlavhadagi ▾ tugmasida.
+
+- **Aloqa uzilsa yoki server qayta ishga tushsa:** yozilgan iboralar qayta yuboriladi, sahifa esa o'tkazib yuborilgan
+  tarjimalarni serverdan qayta oladi.
+- **Bir seminarga bir nechta qurilma ulansa:** masalan, telefon yozadi, noutbukda o'qiladi. Ikki qurilma bir xil gapni
+  yozsa, u bir marta saqlanadi.
+- **Kun bo'yi hisobot:** 1–2 daqiqa olishi mumkin. U fonda tayyorlanadi va sahifa tayyor bo'lishini o'zi kutadi.
+- **Telefonda:** yozish paytida ekranni o'chirmang va sahifani boshqa ilova ostida qoldirmang. Brauzer fondagi
+  mikrofonni to'xtatadi, bunda sahifa ogohlantirish ko'rsatadi.
 
 ## Ishga tushirish (Docker)
 
@@ -36,6 +73,9 @@ python bot.py   # bot
 | `WEB_PASSWORD` | kirish paroli. Bo'sh qolsa, saytni ochgan har kim API kalitlaringizni sarflaydi |
 | `SSL_SELF_SIGNED=1` | HTTPS'ni o'z-o'zidan yaratilgan sertifikat bilan yoqadi |
 | `SSL_CERTFILE` / `SSL_KEYFILE` | o'z sertifikatingiz (masalan, Let's Encrypt) |
+| `VOICEPRINTS=0` | spikerlarni faqat Gemini bilan ajratish (ovoz izi modelisiz) |
+| `GEMINI_REPORT_MODEL` | hisobot uchun boshqa model (bo'sh bo'lsa `GEMINI_MODEL`) |
+| `TIMEZONE` | hisobotdagi vaqtlar uchun (standart `Asia/Tashkent`) |
 
 **Mikrofon faqat HTTPS'da ishlaydi** (brauzer talabi, faqat `localhost` bundan mustasno). Agar domen bo'lmasa:
 1. `SSL_SELF_SIGNED=1` qo'ying.
@@ -65,8 +105,10 @@ Kirish himoyasi:
 
 ## Saytdan foydalanish
 
-- **Manba:** 🎤 mikrofon yoki 🖥️ tab ovozi. Tab ovozi video yoki qo'ng'iroqni tarjima qilish uchun, Chrome'da "Share tab audio" ni belgilang.
-- **O'zbekcha gap tarjimasi:** o'zbekcha gapirilganda qaysi tilga o'girilishini tanlaysiz.
+- **Manba:** 🎤 mikrofon yoki 🖥️ tab ovozi. Tab ovozi onlayn seminar yoki video uchun, Chrome'da "Share tab audio"
+  ni belgilang.
+- **O'zbekcha nutq:** "o'zbekcha qolsin" (seminar uchun) yoki boshqa tilga tarjima (suhbat uchun).
+- **Asl matn:** tarjima ostida asl tildagi matnni ham ko'rsatadi.
 - **🔊 Ovozli o'qish:** tarjima ElevenLabs bilan o'qiladi.
   - Ovoz o'zi qayta tarjima qilinib qolmasligi uchun o'qish paytida mikrofon pauzaga o'tadi.
   - Kimdir gapirayotgan bo'lsa, o'qish u gapini tugatguncha kutadi.

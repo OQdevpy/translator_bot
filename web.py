@@ -1,9 +1,10 @@
-"""Real-time interpreter web app.
+"""Live seminar interpreter web app.
 
-The browser cuts microphone (or tab) audio into speech segments at pauses and
-sends each one over a WebSocket as WAV; Gemini detects the language and
-translates it (other languages -> Uzbek, Uzbek -> chosen partner language),
-and the result comes back on the same socket. One port serves everything.
+The browser cuts microphone (or tab) audio into phrases at pauses and streams them
+over a WebSocket as WAV. seminar.LiveSession transcribes each phrase, works out who
+is speaking and interprets every finished thought into Uzbek with the whole seminar
+as context. Sessions are stored, so they can run all day, and a report can be made
+for any time range. One port serves the page, the API and the WebSocket.
 """
 import asyncio
 import hashlib
@@ -11,40 +12,80 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import struct
 import time
-from collections import deque
+from collections import OrderedDict
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, Form, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
-from google.genai import types
 from pydantic import BaseModel
 
-from translator import DEFAULT_PARTNER, HISTORY_SIZE, LANGS, PARTNER_LANGS, Interpreter, Speaker
+import report
+from seminar import (
+    KEEP_UZBEK,
+    LiveSession,
+    ReportRangeError,
+    SeminarAI,
+    SeminarStore,
+    public_speaker,
+    start_report_job,
+)
+from translator import LANGS, PARTNER_LANGS, Interpreter, Speaker
 from usage import UsageLog
+from voiceprint import Voiceprints
 
 STATIC_DIR = Path(__file__).parent / "static"
 COOKIE = "stt_session"
 MAX_SEGMENT_BYTES = 2_000_000  # ~60 s of 16 kHz 16-bit mono WAV
 MAX_TTS_CHARS = 1000
-MAX_QUEUED_SEGMENTS = 20  # per connection; protects the API budget from a runaway client
+TTS_CACHE_ITEMS = 100  # recent read-outs kept: every device reading out a unit gets the same clip
+UNITS_ON_PAGE = 400  # older parts stay in the database and the reports
 SESSION_SECONDS = 30 * 24 * 3600
 LOGIN_FREE_FAILS = 5  # wrong passwords per IP before it is locked out
 LOGIN_LOCK_SECONDS = 60  # doubles with every further failure
 LOGIN_LOCK_MAX = 3600
 LOGIN_FAIL_DELAY = 1.0  # seconds; slows down guessing without holding a worker thread
+UNLOAD_CHECK_SECONDS = 5.0
+UNLOAD_GRACE_SECONDS = 90.0  # a phone back on the Wi-Fi within this finds the session as it left it
+MAX_FRAME_AGE = 24 * 3600  # a phrase "older" than this is a broken client: it gets the arrival time
+CLIENT_ID = re.compile(r"[A-Za-z0-9_-]{1,40}")  # one per page load, so resent phrases are recognised
 
 log = logging.getLogger("stt_web")
 
 
 class TtsRequest(BaseModel):
     text: str
+
+
+class NewSession(BaseModel):
+    title: str = ""
+
+
+class SessionUpdate(BaseModel):
+    title: str | None = None
+    partner: str | None = None
+
+
+class SpeakerUpdate(BaseModel):
+    label: str
+
+
+class SpeakerMerge(BaseModel):
+    into: str
+
+
+class ReportRequest(BaseModel):
+    start: float | None = None
+    end: float | None = None
 
 
 def sign_session(secret: bytes, password: str, expires: int) -> str:
@@ -71,15 +112,21 @@ def same_origin(headers) -> bool:
 
 
 def create_app(
-    interpreter: Interpreter,
+    ai: SeminarAI,
+    store: SeminarStore,
+    voiceprints: Voiceprints | None = None,
     speaker: Speaker | None = None,
     password: str = "",
     secret: bytes | None = None,
+    tz: ZoneInfo = ZoneInfo("Asia/Tashkent"),
 ) -> FastAPI:
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
     secret = secret or secrets.token_bytes(32)
     login_failures: dict[str, tuple[int, float]] = {}  # ip -> (failures, locked until)
+    live: dict[int, LiveSession] = {}  # sessions with connected clients or unfinished work
+    report_jobs: set[asyncio.Task] = set()  # keeps background report tasks alive
+    store.fail_unfinished_reports("Server qayta ishga tushdi, hisobotni qaytadan tayyorlang")
 
     def authorized(cookies) -> bool:
         return not password or valid_session(secret, password, cookies.get(COOKIE, ""))
@@ -87,6 +134,49 @@ def create_app(
     def require_auth(request: Request):
         if not authorized(request.cookies):
             raise HTTPException(401, "login required")
+
+    def session_or_404(session_id: int) -> dict:
+        row = store.session(session_id)
+        if row is None:
+            raise HTTPException(404, "session not found")
+        return row
+
+    def get_live(session_id: int) -> LiveSession:
+        if session_id not in live:
+            live[session_id] = LiveSession(session_id, store, ai, voiceprints, tz)
+        return live[session_id]
+
+    async def unload_when_idle(sess: LiveSession):
+        """Keeps the session in memory while anyone is connected, its work is unfinished, or for a grace
+        period after the last client left (a reload loses the dedupe of resent phrases and the timing)."""
+        while not sess.clients and not sess.closed:
+            if not sess.busy() and sess.idle_timer is None and time.monotonic() - sess.idle_since >= UNLOAD_GRACE_SECONDS:
+                sess.close()
+                if live.get(sess.id) is sess:
+                    live.pop(sess.id)
+                return
+            await asyncio.sleep(UNLOAD_CHECK_SECONDS)
+
+    tts_cache: OrderedDict[str, bytes] = OrderedDict()  # text -> MP3, least recently used first
+    tts_jobs: dict[str, asyncio.Task] = {}  # syntheses in progress: concurrent requests share one
+
+    async def synthesize(text: str) -> bytes:
+        if text in tts_cache:
+            tts_cache.move_to_end(text)
+            return tts_cache[text]
+
+        async def run():
+            audio = await asyncio.to_thread(speaker.synthesize, text)
+            tts_cache[text] = audio
+            while len(tts_cache) > TTS_CACHE_ITEMS:
+                tts_cache.popitem(last=False)
+            return audio
+
+        job = tts_jobs.get(text)
+        if job is None:
+            job = tts_jobs[text] = asyncio.create_task(run())
+            job.add_done_callback(lambda _: tts_jobs.pop(text, None))
+        return await asyncio.shield(job)  # a device giving up must not cancel the others' read-out
 
     @app.get("/healthz")
     def healthz():
@@ -139,9 +229,9 @@ def create_app(
         return {
             "langs": {code: {"flag": flag, "name": name} for code, (flag, name, _) in LANGS.items()},
             "partners": PARTNER_LANGS,
-            "default_partner": DEFAULT_PARTNER,
             "tts": speaker is not None,
             "auth": bool(password),
+            "voiceprints": voiceprints is not None,
         }
 
     @app.post("/api/tts")
@@ -153,14 +243,175 @@ def create_app(
         if not text or len(text) > MAX_TTS_CHARS:
             raise HTTPException(400, f"text must be 1..{MAX_TTS_CHARS} characters")
         try:
-            audio = await asyncio.to_thread(speaker.synthesize, text)
+            audio = await synthesize(text)
         except Exception:
             log.exception("TTS failed")
             raise HTTPException(502, "TTS failed")
         return Response(audio, media_type="audio/mpeg")
 
+    # ----- sessions
+
+    @app.get("/api/sessions")
+    def list_sessions(request: Request):
+        require_auth(request)
+        return store.sessions()
+
+    @app.post("/api/sessions")
+    def create_session(body: NewSession, request: Request):
+        require_auth(request)
+        title = body.title.strip()[:200] or f"Seminar {datetime.now(tz):%d.%m.%Y %H:%M}"
+        row = store.create_session(title)
+        return {key: row[key] for key in ("id", "title", "created_at", "partner", "notes")}
+
+    @app.get("/api/sessions/{session_id}")
+    def get_session(session_id: int, request: Request):
+        require_auth(request)
+        row = session_or_404(session_id)
+        sess = live.get(session_id)
+        pending = sess.pending if sess else store.pending_segments(session_id)
+        speakers = sess.speakers.values() if sess else store.speakers(session_id)
+        return {
+            "id": row["id"],
+            "title": row["title"],
+            "created_at": row["created_at"],
+            "partner": row["partner"],
+            "notes": row["notes"],
+            "speakers": [public_speaker(sp) for sp in speakers],
+            "units": store.units(session_id, limit=UNITS_ON_PAGE),
+            "units_on_page": UNITS_ON_PAGE,
+            "pending": [{"speaker": p["speaker"], "lang": p["lang"], "text": p["text"]} for p in pending],
+            "interpreting": sess.interpreting_count() if sess else 0,
+            "reports": store.reports(session_id),
+        }
+
+    @app.patch("/api/sessions/{session_id}")
+    def update_session(session_id: int, body: SessionUpdate, request: Request):
+        require_auth(request)
+        session_or_404(session_id)
+        if body.partner is not None and body.partner not in [KEEP_UZBEK, *PARTNER_LANGS]:
+            raise HTTPException(400, "unknown language")  # before any change, so nothing is half-applied
+        if body.title is not None and body.title.strip():
+            store.update_session(session_id, title=body.title.strip()[:200])
+        if body.partner is not None:
+            if session_id in live:
+                live[session_id].set_partner(body.partner)
+            else:
+                store.update_session(session_id, partner=body.partner)
+        return {"ok": True}
+
+    @app.delete("/api/sessions/{session_id}")
+    async def delete_session(session_id: int, request: Request):  # async: LiveSession.close touches the event loop
+        require_auth(request)
+        session_or_404(session_id)
+        sess = live.pop(session_id, None)
+        if sess:
+            sess.close()
+            for ws in list(sess.clients):  # other devices on this seminar move to another one
+                try:
+                    await ws.close(code=4404)
+                except Exception:
+                    pass
+            sess.clients.clear()
+        store.delete_session(session_id)
+        return {"ok": True}
+
+    def speaker_ids(session_id: int) -> set[str]:
+        sess = live.get(session_id)
+        return set(sess.speakers) if sess else {sp["id"] for sp in store.speakers(session_id)}
+
+    @app.patch("/api/sessions/{session_id}/speakers/{speaker_id}")
+    async def rename_speaker(session_id: int, speaker_id: str, body: SpeakerUpdate, request: Request):
+        require_auth(request)
+        session_or_404(session_id)
+        label = body.label.strip()[:80]
+        if speaker_id not in speaker_ids(session_id) or not label:
+            raise HTTPException(400, "unknown speaker or empty name")
+        sess = get_live(session_id)
+        await sess.rename_speaker(speaker_id, label)
+        asyncio.create_task(unload_when_idle(sess))
+        return {"ok": True}
+
+    @app.post("/api/sessions/{session_id}/speakers/{speaker_id}/merge")
+    async def merge_speaker(session_id: int, speaker_id: str, body: SpeakerMerge, request: Request):
+        require_auth(request)
+        session_or_404(session_id)
+        ids = speaker_ids(session_id)
+        if speaker_id == body.into or speaker_id not in ids or body.into not in ids:
+            raise HTTPException(400, "unknown speaker")
+        sess = get_live(session_id)
+        await sess.merge_speakers(speaker_id, body.into)
+        asyncio.create_task(unload_when_idle(sess))
+        return {"ok": True}
+
+    # ----- reports
+
+    @app.post("/api/sessions/{session_id}/reports")
+    async def make_report(session_id: int, body: ReportRequest, request: Request):
+        require_auth(request)
+        session_or_404(session_id)
+        start = body.start if body.start is not None else 0.0
+        end = body.end if body.end is not None else time.time() + 60
+        if start >= end:
+            raise HTTPException(400, "Boshlanish vaqti tugashdan oldin bo'lishi kerak")
+        try:
+            report_id, job = start_report_job(store, ai, session_id, start, end, tz)
+        except ReportRangeError as e:
+            raise HTTPException(400, str(e))
+        report_jobs.add(job)
+        job.add_done_callback(report_jobs.discard)
+        return {"id": report_id, "status": "pending"}
+
+    @app.get("/api/reports/{report_id:int}/status")
+    def report_status(report_id: int, request: Request):
+        require_auth(request)
+        row = store.report(report_id)
+        if row is None:
+            raise HTTPException(404, "report not found")
+        return {"id": report_id, "status": row["status"], "error": row["error"]}
+
+    def report_parts(report_id: int):
+        row = store.report(report_id)
+        if row is None:
+            raise HTTPException(404, "report not found")
+        if row["status"] != "done":
+            raise HTTPException(409, row["error"] or "Hisobot hali tayyor emas")
+        session = store.session(row["session_id"])
+        units = store.units(row["session_id"], row["start"], row["end"])
+        return row, session, units, store.speaker_labels(row["session_id"])
+
+    @app.get("/api/reports/{report_id:int}.md")
+    def report_markdown(report_id: int, request: Request):
+        require_auth(request)
+        md = report.to_markdown(*report_parts(report_id), tz)
+        return PlainTextResponse(
+            md,
+            media_type="text/markdown; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="hisobot-{report_id}.md"'},
+        )
+
+    @app.get("/api/reports/{report_id:int}")
+    def report_page(report_id: int, request: Request):
+        if not authorized(request.cookies):
+            return RedirectResponse("/", status_code=303)
+        row = store.report(report_id)
+        if row is not None and row["status"] != "done":
+            return HTMLResponse(report.waiting_page(row), status_code=200 if row["status"] == "pending" else 500)
+        return HTMLResponse(report.to_html(*report_parts(report_id), tz))
+
+    @app.get("/api/sessions/{session_id}/transcript.txt")
+    def transcript(session_id: int, request: Request, start: float | None = None, end: float | None = None):
+        require_auth(request)
+        row = session_or_404(session_id)
+        units = store.units(session_id, start, end)
+        text = f"{row['title']}\n\n" + report.transcript_text(units, store.speaker_labels(session_id), tz)
+        return PlainTextResponse(
+            text, headers={"Content-Disposition": f'attachment; filename="transkript-{session_id}.txt"'}
+        )
+
+    # ----- live audio
+
     @app.websocket("/ws")
-    async def live(ws: WebSocket):
+    async def live_socket(ws: WebSocket):
         await ws.accept()  # accept first: a rejected handshake reaches the browser only as code 1006
         if not authorized(ws.cookies):
             await ws.close(code=4401)  # the page reloads into the login form
@@ -169,42 +420,15 @@ def create_app(
             log.warning("WebSocket origin %s does not match host %s", ws.headers.get("origin"), ws.headers.get("host"))
             await ws.close(code=4403)  # usually a proxy that rewrites Host; the page shows a warning
             return
-        # gen grows on every reset, so answers to segments sent before it are dropped
-        state = {"partner": DEFAULT_PARTNER, "gen": 0}
-        history = deque(maxlen=HISTORY_SIZE)
-        segments: asyncio.Queue[tuple[int, bytes]] = asyncio.Queue()
-
-        async def translate_segments():
-            # One at a time, in order, so every segment sees the previous ones as context.
-            while True:
-                seg_id, wav = await segments.get()
-                gen, partner = state["gen"], state["partner"]
-                part = types.Part.from_bytes(data=wav, mime_type="audio/wav")
-                try:
-                    result = await asyncio.to_thread(interpreter.interpret, [part], partner, list(history), True)
-                except Exception:
-                    log.exception("Segment %s failed", seg_id)
-                    if gen == state["gen"]:
-                        await ws.send_json({"type": "error", "id": seg_id, "message": "Tarjima qilib bo'lmadi"})
-                    continue
-                if gen != state["gen"]:
-                    continue
-                if not result.text or not result.translation:
-                    await ws.send_json({"type": "empty", "id": seg_id})
-                    continue
-                history.append(result)
-                await ws.send_json(
-                    {
-                        "type": "result",
-                        "id": seg_id,
-                        "source_lang": result.source_lang,
-                        "text": result.text,
-                        "translation": result.translation,
-                        "target": partner if result.source_lang == "uz" else "uz",
-                    }
-                )
-
-        worker = asyncio.create_task(translate_segments())
+        session_id = ws.query_params.get("session", "")
+        if not session_id.isdigit() or len(session_id) > 18 or store.session(int(session_id)) is None:
+            await ws.close(code=4404)
+            return
+        client = ws.query_params.get("client", "")
+        if not CLIENT_ID.fullmatch(client):
+            client = ""  # still works, only resent phrases can't be recognised
+        sess = get_live(int(session_id))
+        sess.join(ws)
         try:
             while True:
                 message = await ws.receive()
@@ -212,18 +436,25 @@ def create_app(
                     break
                 if message.get("bytes") is not None:
                     data = message["bytes"]
-                    # frame: 4-byte big-endian segment id + WAV file
-                    if len(data) < 48 or data[4:8] != b"RIFF" or data[12:16] != b"WAVE":
+                    # frame: 4-byte big-endian phrase id, 8-byte float seconds since the phrase ended, WAV file
+                    if len(data) < 56 or data[12:16] != b"RIFF" or data[20:24] != b"WAVE":
                         await ws.send_json({"type": "error", "id": None, "message": "Noto'g'ri audio"})
                         continue
-                    (seg_id,) = struct.unpack(">I", data[:4])
+                    seg_id, age = struct.unpack(">Id", data[:12])
+                    if sess.received_before(client, seg_id):  # its acknowledgement was lost in a reconnect
+                        await ws.send_json({"type": "dup", "id": seg_id})
+                        continue
                     if len(data) > MAX_SEGMENT_BYTES:
                         await ws.send_json({"type": "error", "id": seg_id, "message": "Segment juda uzun"})
                         continue
-                    if segments.qsize() >= MAX_QUEUED_SEGMENTS:
+                    if sess.queue_full():
                         await ws.send_json({"type": "error", "id": seg_id, "message": "Navbat to'lib ketdi"})
                         continue
-                    await segments.put((seg_id, data[4:]))
+                    now = time.time()
+                    # the age, not the device's clock: a skewed clock can't misplace the phrase, and one
+                    # resent after a reconnect keeps its place in the timeline
+                    received = now - age if 0 <= age <= MAX_FRAME_AGE else now
+                    await sess.add_audio(seg_id, data[12:], received, origin=ws, client=client)
                 elif message.get("text") is not None:
                     try:
                         msg = json.loads(message["text"])
@@ -231,17 +462,21 @@ def create_app(
                         continue
                     if not isinstance(msg, dict):
                         continue
-                    if msg.get("type") == "config" and msg.get("partner") in PARTNER_LANGS:
-                        state["partner"] = msg["partner"]
-                    elif msg.get("type") == "reset":
-                        state["gen"] += 1
-                        history.clear()
-                        while not segments.empty():
-                            segments.get_nowait()
+                    kind = msg.get("type")
+                    if kind == "partner" and msg.get("partner") in [KEEP_UZBEK, *PARTNER_LANGS]:
+                        sess.set_partner(msg["partner"])
+                    elif kind == "speech":
+                        sess.set_speaking(ws, msg.get("active") is True)
+                    elif kind == "flush":
+                        sess.request_flush()  # listening stopped: interpret the rest once it is transcribed
+                    elif kind == "ping":
+                        await ws.send_json({"type": "pong"})
         except WebSocketDisconnect:
             pass
         finally:
-            worker.cancel()
+            sess.leave(ws)
+            if not sess.clients:
+                asyncio.create_task(unload_when_idle(sess))
 
     return app
 
@@ -313,8 +548,16 @@ def main():
     password = os.getenv("WEB_PASSWORD", "")
     if not password:
         log.warning("WEB_PASSWORD is empty: anyone who opens the site uses your API keys")
+    tz = ZoneInfo(os.getenv("TIMEZONE") or "Asia/Tashkent")
+    voiceprints = None if os.getenv("VOICEPRINTS", "1").lower() in ("0", "false", "no") else Voiceprints.load(data_dir)
     app = create_app(
-        Interpreter.from_env(usage_log), Speaker.from_env(usage_log), password, session_secret(data_dir)
+        SeminarAI(Interpreter.from_env(usage_log), os.getenv("GEMINI_REPORT_MODEL") or None),
+        SeminarStore(os.path.join(data_dir, "seminars.db")),
+        voiceprints,
+        Speaker.from_env(usage_log),
+        password,
+        session_secret(data_dir),
+        tz,
     )
     host, port = os.getenv("HOST", "0.0.0.0"), int(os.getenv("PORT", "8000"))
     cert, key = ssl_files(data_dir)

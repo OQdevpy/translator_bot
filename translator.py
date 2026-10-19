@@ -1,6 +1,7 @@
 """Gemini interpreter and ElevenLabs voice, shared by the Telegram bot and the web app."""
 import logging
 import os
+from typing import TypeVar
 
 import requests
 from google import genai
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from usage import UsageLog
 
 log = logging.getLogger("stt_bot")
+T = TypeVar("T", bound=BaseModel)
 
 # code -> (flag, Uzbek name for buttons, name for the prompt)
 LANGS = {
@@ -34,13 +36,6 @@ INTERPRET_PROMPT = (
     "- text: the input in its original language; for audio the exact transcription, "
     "empty if there is no speech\n"
     "- translation: only the translation, no pinyin, quotes, notes or explanations"
-)
-LIVE_PROMPT = (
-    "\n\nThe input is the next fragment of continuous live speech, cut at a pause, "
-    "so it may start or end mid-sentence. Transcribe and translate only the words "
-    "in this fragment: do not repeat earlier fragments and do not complete unfinished "
-    "sentences. If it has no intelligible speech (silence, noise, music, coughing), "
-    "return empty text and translation."
 )
 HISTORY_PROMPT = (
     "\n\nConversation so far, oldest first. Use it only as context to resolve meaning, "
@@ -92,29 +87,47 @@ class Interpreter:
             price_out=float(os.getenv("GEMINI_PRICE_OUT") or 7.50),
         )
 
-    def interpret(self, contents, partner: str, history=(), live: bool = False) -> Interpretation:
+    def generate(
+        self,
+        contents,
+        system: str,
+        schema: type[T],
+        thinking: str = "low",
+        temperature: float | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        max_tokens: int | None = None,
+    ) -> T:
+        """One structured Gemini call; usage and cost are recorded.
+
+        temperature None keeps the model's default: Gemini 3 is tuned for 1.0, and lower values can make
+        it loop. timeout (seconds) replaces the client's for this call: a long report needs minutes, a live
+        phrase is better retried than awaited. max_tokens (thinking included) stops a looping answer early."""
+        response = self.client.models.generate_content(
+            model=model or self.model,
+            contents=contents,
+            config=types.GenerateContentConfig(
+                system_instruction=system,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                http_options=None if timeout is None else types.HttpOptions(timeout=int(timeout * 1000)),
+                thinking_config=types.ThinkingConfig(thinking_level=thinking),
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                response_mime_type="application/json",
+                response_schema=schema,
+            ),
+        )
+        self.record_usage(response.usage_metadata)
+        return schema.model_validate_json(response.text or "")
+
+    def interpret(self, contents, partner: str, history=()) -> Interpretation:
         history = list(history)  # a snapshot: callers may append from other threads
         system = INTERPRET_PROMPT.format(partner=LANGS[partner][2])
-        if live:
-            system += LIVE_PROMPT
         if history:
             system += HISTORY_PROMPT.format(
                 history="\n".join(f"[{h.source_lang}] {h.text} => {h.translation}" for h in history)
             )
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=types.GenerateContentConfig(
-                system_instruction=system,
-                temperature=0.2,
-                thinking_config=types.ThinkingConfig(thinking_level="low"),
-                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                response_mime_type="application/json",
-                response_schema=Interpretation,
-            ),
-        )
-        self.record_usage(response.usage_metadata)
-        result = Interpretation.model_validate_json(response.text or "")
+        result = self.generate(contents, system, Interpretation)
         result.source_lang = result.source_lang.strip().lower()
         result.text = result.text.strip()
         result.translation = result.translation.strip()

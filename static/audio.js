@@ -98,8 +98,10 @@ export class Segmenter {
   }
 
   endSilenceMs() {
-    const ms = this.segment.frames.length * FRAME_MS;
-    return ms < 4000 ? 700 : ms < 8000 ? 400 : 250;
+    // a short word ("Thank you.") usually continues: give it longer so it isn't sent alone.
+    // Measured up to the last speech, so the pause itself doesn't make the phrase look long.
+    const ms = (this.segment.speech.lastIndexOf(true) + 1) * FRAME_MS;
+    return ms < 1500 ? 1100 : ms < 4000 ? 700 : ms < 8000 ? 400 : 250;
   }
 
   push(frame) {
@@ -214,10 +216,15 @@ export function encodeWav(samples, sampleRate = SAMPLE_RATE) {
   return buffer;
 }
 
-/** WebSocket frame: 4-byte big-endian segment id + WAV bytes. */
-export function packSegment(id, wav) {
-  const out = new Uint8Array(4 + wav.byteLength);
-  new DataView(out.buffer).setUint32(0, id, false);
-  out.set(new Uint8Array(wav), 4);
+/**
+ * WebSocket frame: 4-byte big-endian segment id, 8-byte big-endian age (seconds since the phrase
+ * ended, taken at send time), WAV bytes. An age instead of a timestamp: the device clock may be off.
+ */
+export function packSegment(id, wav, age = 0) {
+  const out = new Uint8Array(12 + wav.byteLength);
+  const view = new DataView(out.buffer);
+  view.setUint32(0, id, false);
+  view.setFloat64(4, age, false);
+  out.set(new Uint8Array(wav), 12);
   return out;
 }
